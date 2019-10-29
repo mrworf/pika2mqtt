@@ -71,6 +71,7 @@ class PikaDevice:
   UNKNOWN = 0
 
   def __init__(self, entry):
+    self._timestamp = None
     self.update(entry)
 
   def update(self, entry):
@@ -95,6 +96,11 @@ class PikaDevice:
 
     ts = time.strptime(entry[mapping['updated']], '%Y-%m-%d %H:%M:%S %Z')
     ts = datetime.fromtimestamp(time.mktime(ts)).replace(tzinfo=timezone.utc).astimezone(tz=None)
+    if self._timestamp == entry[mapping['updated']]:
+      self.noupdate += 1
+    else:
+      self.noupdate = 0
+      self._timestamp = entry[mapping['updated']]
     self.lastUpdate = ts
 
   def getStateDefinition(self):
@@ -136,17 +142,27 @@ class Pika:
         return found
     return None
 
-  def update(self, devicelist):
-    found = []
-    for device in devicelist:
-      for i in range(0, len(self.devices)):
-        if self.devices[i].serial == device.serial:
-          self.devices[i] = device
-          found.append(device)
-          break
-    for device in devicelist:
-      if not device in found:
-        self.devices.append(device)
+  def update(self, entry):
+    serial = entry['s']
+    found = False
+
+    for i in range(0, len(self.devices)):
+      if self.devices[i].serial == serial:
+        found = True
+        self.devices[i].update(entry)
+        break
+
+    if not found:
+      self.devices.append(PikaDevice(entry))
+
+  def isConnected(self):
+    # Simply check if all devices have a duplicate of 3 or more
+    # since that most likely indicates a lack of change as in
+    # the pika system not reporting in.
+    connected = False
+    for device in self.devices:
+      connected |= (device.noupdate < 3)
+    return connected
 
 class PikaMonitor(threading.Thread):
   def __init__(self, profile, prefix):
@@ -165,6 +181,7 @@ class PikaMonitor(threading.Thread):
   def run(self):
     pika = Pika()
     topics = {}
+    lastConnect = False
     while True:
       try:
         result = requests.get(self.profile)
@@ -182,8 +199,16 @@ class PikaMonitor(threading.Thread):
       print('\x1b[H\x1b[2JSystem status:')
       print('%-8s   %20s . %-8s . %-12s . Device and power' % ('flags', '', 'watts', 'serial'))
       for i in range(0, len(j['dvcs'])):
-        entry = PikaDevice(j['dvcs'][i])
-        pika.update([entry])
+        pika.update(j['dvcs'][i])
+
+      connected = pika.isConnected()
+
+      if not connected:
+        print('WARNING! All information is stale, connection between inverter and pika backend is unavailable\n')
+      if 'connected' not in topics or topics['connected'] != connected:
+        print('Publishing new state (%d) for connected' % connected)
+        self.mqtt.publish(self.prefix + 'connected', 1 if connected else 0)
+        topics['connected'] = connected
 
       for entry in pika.devices:
         print('0x%08x %-20.20s | %8d | %s | %s [%s] | %.1f' % (entry.state, entry.getStateDefinition().description, entry.output, entry.serial, entry.name, entry.getTypeName(), entry.charge))
