@@ -7,4 +7,5 @@ ENV basetopic
 WORKDIR /usr/src/app
 COPY . ./
 
-CMD ["./pika2mqtt.py", "$url", "$mqtt", "$basetopic"]
+#CMD ["./pika2mqtt.py", "$url", "$mqtt", "$basetopic"]
+CMD ["$url", "$mqtt", "$basetopic"]
