@@ -67,3 +67,7 @@ house/energy/battery_00010003BEEF/charge
 Now, when you combine this tool with [telegraf](https://www.influxdata.com/time-series-platform/telegraf/ "telegraf"), [influxDB](https://www.influxdata.com/products/influxdb-overview/ "influxDB") and [grafana](https://grafana.com/ "grafana"), you get nice looking items such as
 
 ![grafana scrennshot](images/grafana.png "Grafana screenshot")
+
+## Docker image
+
+To simplify things, you can also run this as a docker image. The arguments above are provided via environment variables URL, MQTT and BASETOPIC.
