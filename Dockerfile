@@ -1,11 +1,12 @@
 FROM python:3.7-alpine
 
-ENV url
-ENV mqtt
-ENV basetopic
+ENV URL=
+ENV MQTT=
+ENV BASETOPIC=
 
 WORKDIR /usr/src/app
 COPY . ./
 
-#CMD ["./pika2mqtt.py", "$url", "$mqtt", "$basetopic"]
-CMD ["$url", "$mqtt", "$basetopic"]
+RUN pip3 install requests paho-mqtt
+
+CMD /usr/src/app/pika2mqtt.py "$URL" "$MQTT" "$BASETOPIC"
