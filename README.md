@@ -71,3 +71,5 @@ Now, when you combine this tool with [telegraf](https://www.influxdata.com/time-
 ## Docker image
 
 To simplify things, you can also run this as a docker image. The arguments above are provided via environment variables URL, MQTT and BASETOPIC. You need to run it with a terminal (ie, `-t`) or it will not work
+
+The project is published on https://hub.docker.com/r/mrworf/pika2mqtt
