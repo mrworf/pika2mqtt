@@ -210,6 +210,8 @@ class PikaMonitor(threading.Thread):
         self.mqtt.publish(self.prefix + 'connected', 1 if connected else 0)
         topics['connected'] = connected
 
+      total_solar = 0
+
       for entry in pika.devices:
         print('0x%08x %-20.20s | %8d | %s | %s [%s] | %.1f' % (entry.state, entry.getStateDefinition().description, entry.output, entry.serial, entry.name, entry.getTypeName(), entry.charge))
         topic = (self.prefix + '%s_%s' % (entry.getTypeName(), entry.serial)).lower()
@@ -217,6 +219,8 @@ class PikaMonitor(threading.Thread):
         input = entry.input
         state = entry.state
         charge = entry.charge
+        if entry.type == PikaDevice.SOLAR:
+          total_solar += output
 
         if topic not in topics or topics[topic]['state'] != state:
           print('Publishing new state (%x) for %s' % (state, topic))
@@ -234,6 +238,12 @@ class PikaMonitor(threading.Thread):
           print('Publishing new charge (%.1f) for %s' % (charge, topic))
           self.mqtt.publish(topic + '/charge', int(charge * 10))
         topics[topic] = {'input': input, 'output': output, 'state':state, 'charge':charge}
+
+      # Publish a total solar output index as well
+      topic = self.prefix + 'solar_total'
+      if topic not in topics or topics[topic]['output'] != total_solar:
+        print('Publishing new input (%d) for %s' % (total_solar, topic))
+        self.mqtt.publish(topic + '/output', total_solar)
 
       time.sleep(REFRESH)
 
