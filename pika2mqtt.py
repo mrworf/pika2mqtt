@@ -165,12 +165,14 @@ class Pika:
     return connected
 
 class PikaMonitor(threading.Thread):
-  def __init__(self, profile, prefix):
+  def __init__(self, profile, prefix, ignoreSerials=None):
     threading.Thread.__init__(self)
     self.daemon = True
     self.profile = profile
     self.mqtt = None
     self.prefix = prefix
+    self.ignore = ignoreSerials
+
     if self.prefix[-1] != '/':
       self.prefix += '/'
 
@@ -213,6 +215,8 @@ class PikaMonitor(threading.Thread):
       total_solar = 0
 
       for entry in pika.devices:
+        if entry.serial in self.ignore:
+          continue
         print('0x%08x %-20.20s | %8d | %s | %s [%s] | %.1f' % (entry.state, entry.getStateDefinition().description, entry.output, entry.serial, entry.name, entry.getTypeName(), entry.charge))
         topic = (self.prefix + '%s_%s' % (entry.getTypeName(), entry.serial)).lower()
         output = entry.output
@@ -252,6 +256,7 @@ parser.add_argument('--logfile', metavar="FILE", help="Log to file instead of st
 parser.add_argument('url', help='Public PIKA url (for example https://profiles.pika-energy.com/users/0123456789)')
 parser.add_argument('mqtt', help='MQTT Broker to publish topics')
 parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<type>_<serial>/x where x is one of watt or state')
+parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
 cmdline = parser.parse_args()
 
 m = re.match('https://profiles.pika-energy.com/users/([0-9]+)', cmdline.url)
@@ -264,6 +269,6 @@ client = mqtt.Client()
 #client.on_message = on_message
 client.connect(cmdline.mqtt, 1883, 60)
 
-monitor = PikaMonitor('https://profiles.pika-energy.com/%s.json' % m.group(1), cmdline.basetopic)
+monitor = PikaMonitor('https://profiles.pika-energy.com/%s.json' % m.group(1), cmdline.basetopic, cmdline.ignore)
 monitor.start(client)
 client.loop_forever()

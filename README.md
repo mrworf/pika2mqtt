@@ -11,6 +11,7 @@ It's really simple, it requires the URL to your pika profile. Unfortunately, bec
 - url to your profile (for example, https://profiles.pika-energy.com/users/0123456789)
 - MQTT broker (for example, mqtt.local)
 - A base for all topics to be published, I use `house/energy`
+- Zero or more serials (all uppercase) which should be ignored
 
 A complete command line would look like this (using above information)
 
