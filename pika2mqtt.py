@@ -325,6 +325,9 @@ class PikaMonitor(threading.Thread):
       if inv:
         self.publish('grid', 'input', abs(min(0, inv['fixed']['CTPow'])))
         self.publish('grid', 'output', max(0, inv['fixed']['CTPow']))
+        dev = pika.find(type = PikaDevice.INVERTER)
+        if dev:
+          self.publish('house', 'input', dev.output - inv['fixed']['CTPow'])
 
       time.sleep(REFRESH)
 
