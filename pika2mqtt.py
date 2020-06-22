@@ -127,6 +127,57 @@ class PikaDevice:
     if t == '0012': return PikaDevice.BEACON
     return PikaDevice.UNKNOWN
 
+class PikaInstallerDevice:
+  def __init__(self, rcpn, entry):
+    self._timestamp = None
+    self._rcpn = rcpn
+    self.noupdate = 0
+    self.update(entry)
+
+  def update(self, data):
+    # Locate the device info we need
+    entry = None
+    for k in data:
+      for i in data[k]:
+        if i['rcpn'] == self._rcpn and i['modID'] is not None and i['lastheard'] is not None:
+          entry = i
+          break
+      if entry: break
+
+    if not entry:
+      print('Error: Cannot find RCPN item %s' % self._rcpn)
+      return
+
+    self.type = self.determineType(entry['rcpn'])
+    self.serial = entry['rcpn']
+    self.name = entry['type']
+    self.state = 0
+    self.output = max(0,entry['power'])
+    self.input = abs(min(0, entry['power']))
+    self.charge = entry.get('soc', 0)
+    self.modid = entry['modID']
+
+  def getStateDefinition(self):
+    return PikaState.DEFINITIONS['UNDEFINED']
+
+  def getTypeName(self):
+    types = ['Unknown', 'Wind', 'Inverter', 'Solar', 'Weatherstation', 'Battery', 'Load', 'Beacon']
+    return types[max(0, min(len(types)-1, self.type))]
+
+  def hasPower(self):
+    return self.type not in [PikaDevice.BEACON, PikaDevice.UNKNOWN, PikaDevice.WEATHERSTATION]
+
+  def determineType(self, serial):
+    t = serial[4:8]
+    if t == '0001': return PikaDevice.WIND
+    if t == '0002' or t == '0007': return PikaDevice.INVERTER
+    if t == '0003': return PikaDevice.SOLAR
+    if t == '0004': return PikaDevice.WEATHERSTATION
+    if t == '0005' or t == '0008': return PikaDevice.BATTERY
+    if t == '0006': return PikaDevice.LOAD
+    if t == '0012': return PikaDevice.BEACON
+    return PikaDevice.UNKNOWN
+
 class Pika:
   def __init__(self):
     self.devices = []
@@ -142,18 +193,33 @@ class Pika:
         return found
     return None
 
-  def update(self, entry):
-    serial = entry['s']
-    found = False
+  def update(self, data):
+    if 'dvcs' in data:
+      for i in range(0, len(data['dvcs'])):
+        entry = data['dvcs'][i]
+        serial = entry['s']
+        found = False
 
-    for i in range(0, len(self.devices)):
-      if self.devices[i].serial == serial:
-        found = True
-        self.devices[i].update(entry)
-        break
+        for i in range(0, len(self.devices)):
+          if self.devices[i].serial == serial:
+            found = True
+            self.devices[i].update(entry)
+            break
 
-    if not found:
-      self.devices.append(PikaDevice(entry))
+        if not found:
+          self.devices.append(PikaDevice(entry))
+    else:
+      for k in data:
+        for i in data[k]:
+          if 'rcpn' in i and i['modID'] is not None and i['lastheard'] is not None:
+            found = False
+            for e in range(0, len(self.devices)):
+              if self.devices[e].serial == i['rcpn']:
+                found = True
+                self.devices[e].update(data)
+                break
+            if not found:
+              self.devices.append(PikaInstallerDevice(i['rcpn'], data))
 
   def isConnected(self):
     # Simply check if all devices have a duplicate of 3 or more
@@ -165,16 +231,27 @@ class Pika:
     return connected
 
 class PikaMonitor(threading.Thread):
-  def __init__(self, profile, prefix, ignoreSerials=None):
+  def __init__(self, url, prefix, ignoreSerials=None, installerMode=False):
     threading.Thread.__init__(self)
     self.daemon = True
-    self.profile = profile
+    self.url = url
     self.mqtt = None
     self.prefix = prefix
     self.ignore = ignoreSerials
+    self.topics = {}
+    self.installerMode = installerMode
 
     if self.prefix[-1] != '/':
       self.prefix += '/'
+
+  def publish(self, topic, key, value):
+    topic = self.prefix + topic
+    if topic not in self.topics or self.topics[topic].get(key, None) != value:
+      print('Publishing new %s (%s) for %s' % (key, repr(value), topic))
+      self.mqtt.publish(topic + '/' + key, value)
+      if topic not in self.topics:
+        self.topics[topic] = {}
+      self.topics[topic][key] = value
 
   def start(self, mqtt):
     self.mqtt = mqtt
@@ -186,7 +263,10 @@ class PikaMonitor(threading.Thread):
     lastConnect = False
     while True:
       try:
-        result = requests.get(self.profile)
+        url = self.url
+        if installer:
+          url = self.url + '/devices'
+        result = requests.get(url)
       except requests.exceptions.ConnectionError:
         print('Connection error')
         time.sleep(1)
@@ -198,10 +278,19 @@ class PikaMonitor(threading.Thread):
         continue
 
       j = result.json()
-      print('\x1b[H\x1b[2JSystem status:')
-      print('%-8s   %20s . %-8s . %-12s . Device and power' % ('flags', '', 'watts', 'serial'))
-      for i in range(0, len(j['dvcs'])):
-        pika.update(j['dvcs'][i])
+      pika.update(j)
+
+      # Next, fetch the status of the inverter so we see the grid power
+      inv = None
+      if self.installerMode:
+        inv = pika.find(type = PikaDevice.INVERTER)
+        if inv:
+          try:
+            result = requests.get(self.url + '/device/%d/model/inverter_status' % inv.modid)
+            inv = result.json()
+          except requests.exceptions.ConnectionError:
+            print('Connection error')
+            inv = None
 
       connected = pika.isConnected()
 
@@ -217,37 +306,25 @@ class PikaMonitor(threading.Thread):
       for entry in pika.devices:
         if entry.serial in self.ignore:
           continue
-        print('0x%08x %-20.20s | %8d | %s | %s [%s] | %.1f' % (entry.state, entry.getStateDefinition().description, entry.output, entry.serial, entry.name, entry.getTypeName(), entry.charge))
-        topic = (self.prefix + '%s_%s' % (entry.getTypeName(), entry.serial)).lower()
-        output = entry.output
-        input = entry.input
-        state = entry.state
-        charge = entry.charge
+        print('%8d | %s | %s [%s] | %.1f' % (entry.output, entry.serial, entry.name, entry.getTypeName(), entry.charge))
+        topic = ('%s_%s' % (entry.getTypeName(), entry.serial)).lower()
         if entry.type == PikaDevice.SOLAR:
-          total_solar += output
+          total_solar += entry.output
 
-        if topic not in topics or topics[topic]['state'] != state:
-          print('Publishing new state (%x) for %s' % (state, topic))
-          self.mqtt.publish(topic + '/state', state)
+        self.publish(topic, 'state', entry.state)
 
         if entry.hasPower():
-          if topic not in topics or topics[topic]['output'] != output:
-            print('Publishing new output (%d) for %s' % (output, topic))
-            self.mqtt.publish(topic + '/output', output)
-          if topic not in topics or topics[topic]['input'] != input:
-            print('Publishing new input (%d) for %s' % (input, topic))
-            self.mqtt.publish(topic + '/input', input)
+          self.publish(topic, 'output', entry.output)
+          self.publish(topic, 'input', entry.input)
 
-        if entry.type == PikaDevice.BATTERY and (topic not in topics or topics[topic]['charge'] != charge):
-          print('Publishing new charge (%.1f) for %s' % (charge, topic))
-          self.mqtt.publish(topic + '/charge', int(charge * 10))
-        topics[topic] = {'input': input, 'output': output, 'state':state, 'charge':charge}
+        if entry.type == PikaDevice.BATTERY:
+          self.publish(topic, 'charge', int(entry.charge*10))
 
       # Publish a total solar output index as well
-      topic = self.prefix + 'solar_total'
-      if topic not in topics or topics[topic]['output'] != total_solar:
-        print('Publishing new input (%d) for %s' % (total_solar, topic))
-        self.mqtt.publish(topic + '/output', total_solar)
+      self.publish('solar_total', 'output', total_solar)
+      if inv:
+        self.publish('grid', 'input', abs(min(0, inv['fixed']['CTPow'])))
+        self.publish('grid', 'output', max(0, inv['fixed']['CTPow']))
 
       time.sleep(REFRESH)
 
@@ -259,16 +336,18 @@ parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<
 parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
 cmdline = parser.parse_args()
 
+url = cmdline.url
+installer = True
 m = re.match('https://profiles.pika-energy.com/users/([0-9]+)', cmdline.url)
 if m is None:
-  print('URL "%s" is not valid' % cmdline.url)
-  sys.exit(255)
+  print('URL "%s" is assumed to be a PIKA system in installer mode' % cmdline.url)
+else:
+  url = 'https://profiles.pika-energy.com/%s.json' % m.group(1)
+  installer = False
 
 client = mqtt.Client()
-#client.on_connect = on_connect
-#client.on_message = on_message
 client.connect(cmdline.mqtt, 1883, 60)
 
-monitor = PikaMonitor('https://profiles.pika-energy.com/%s.json' % m.group(1), cmdline.basetopic, cmdline.ignore)
+monitor = PikaMonitor(url, cmdline.basetopic, cmdline.ignore, installer)
 monitor.start(client)
 client.loop_forever()
