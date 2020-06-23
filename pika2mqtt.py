@@ -287,9 +287,20 @@ class PikaMonitor(threading.Thread):
         if inv:
           try:
             result = requests.get(self.url + '/device/%d/model/inverter_status' % inv.modid)
-            inv = result.json()
+            if result is None or result.status_code != 200:
+              print('Failed to retrieve inverter info, result is: %d' % result.status_code)
+              print(repr(result.headers))
+              print(repr(result.text))
+              inv = None
+            else:
+              inv = result.json()
           except requests.exceptions.ConnectionError:
             print('Connection error')
+            inv = None
+          except:
+            print('Failed to retrieve inverter info, result is: %d' % result.status_code)
+            print(repr(result.headers))
+            print(repr(result.text))
             inv = None
 
       connected = pika.isConnected()
