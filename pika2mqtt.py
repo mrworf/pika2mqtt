@@ -294,6 +294,10 @@ class PikaMonitor(threading.Thread):
               inv = None
             else:
               inv = result.json()
+              if not 'fixed' in inv or not 'CTPow' in inv['fixed']:
+                print('JSON doesnt hold all the fields we need')
+                print(repr(inv))
+                inv = None
           except requests.exceptions.ConnectionError:
             print('Connection error')
             inv = None
