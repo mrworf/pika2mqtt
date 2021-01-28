@@ -338,11 +338,12 @@ class PikaMonitor(threading.Thread):
       # Publish a total solar output index as well
       self.publish('solar_total', 'output', total_solar)
       if inv:
-        self.publish('grid', 'input', abs(min(0, inv['fixed']['CTPow'])))
-        self.publish('grid', 'output', max(0, inv['fixed']['CTPow']))
+        ctpow = inv.get('fixed', {}).get('CTPow', 0)
+        self.publish('grid', 'input', abs(min(0, ctpow)))
+        self.publish('grid', 'output', max(0, ctpow))
         dev = pika.find(type = PikaDevice.INVERTER)
         if dev:
-          self.publish('house', 'input', dev.output - inv['fixed']['CTPow'])
+          self.publish('house', 'input', dev.output - ctpow)
 
       time.sleep(REFRESH)
 
