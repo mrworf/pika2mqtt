@@ -339,11 +339,12 @@ class PikaMonitor(threading.Thread):
       self.publish('solar_total', 'output', total_solar)
       if inv:
         ctpow = inv.get('fixed', {}).get('CTPow', 0)
-        self.publish('grid', 'input', abs(min(0, ctpow)))
-        self.publish('grid', 'output', max(0, ctpow))
-        dev = pika.find(type = PikaDevice.INVERTER)
-        if dev:
-          self.publish('house', 'input', dev.output - ctpow)
+        if ctpow is not None:
+          self.publish('grid', 'input', abs(min(0, ctpow)))
+          self.publish('grid', 'output', max(0, ctpow))
+          dev = pika.find(type = PikaDevice.INVERTER)
+          if dev:
+            self.publish('house', 'input', dev.output - ctpow)
 
       time.sleep(REFRESH)
 
