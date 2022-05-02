@@ -10,6 +10,8 @@ It's really simple, it requires the URL to your pika profile. Unfortunately, bec
 
 ### With the public profile information
 
+> *Currently broken, author uses installer mode and will not be fixing this*
+
 - url to your profile (for example, https://profiles.pika-energy.com/users/0123456789)
 - MQTT broker (for example, mqtt.local)
 - A base for all topics to be published, I use `house/energy`
@@ -23,10 +25,12 @@ A complete command line would look like this (using above information)
 
 ### With the Pika inverter in installer mode
 
-- url to your inverter, simply the IP/DNS name of it (for example, http://my-inverter.domain.net)
-- MQTT broker (for example, mqtt.local)
+- url to your inverter, simply the IP/DNS name of it (for example, `http://my-inverter.domain.net` or `http://192.168.1.42`)
+- MQTT broker (for example, `mqtt.local`)
 - A base for all topics to be published, I use `house/energy`
 - Zero or more serials (all uppercase) which should be ignored
+
+> For details on how to run installer mode, see [INSTALLER.md](extras/INSTALLER.md) in the `extras/` directory
 
 Once started, the tool and begin polling the JSON endpoints every minute (that's as often as they refresh the data on their website, so don't bother hitting it harder).
 
@@ -65,7 +69,8 @@ house/energy/house/input
 
 This uses the Current transformers (CT) which are clamped around the feed to your main panel and will show how much you consume from the grid (output) or sell to the grid (input). Likewise, house topic implies how much power your household is consuming.
 
-These three topics will *only* be available if you run in installer mode and have CT installed properly (some installers will sometimes install them on the feed between the main panel and the inverter, which obviously will be a bit misleading).
+> ***NOTE***
+> These three topics will *only* be available if you run in installer mode and have CT installed properly (some installers will sometimes install them on the feed between the main panel and the inverter, which obviously will be a bit misleading).
 
 Now, when you combine this tool with [telegraf](https://www.influxdata.com/time-series-platform/telegraf/ "telegraf"), [influxDB](https://www.influxdata.com/products/influxdb-overview/ "influxDB") and [grafana](https://grafana.com/ "grafana"), you get nice looking items such as
 
