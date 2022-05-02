@@ -1,0 +1,12 @@
+#!/bin/bash
+#
+# Make sure we emulate iptables-restore as needed, but rework any rules
+#
+# Place this in partition 7, under /user/usr/sbin/iptables-restore
+#
+
+# Piped data, make sure to rewrite port 80 to accept
+sed 's/port 80 -j DROP/port 80 -j ACCEPT/' | /usr/sbin/xtables-legacy-multi iptables-restore $@
+
+# Also return the true exit code
+exit $?
