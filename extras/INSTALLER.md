@@ -133,7 +133,10 @@ That is, `/bin/init`
 - Factory is better, but it's a squashfs filesystem and cannot be changed
 - init.sh would be great to tweak, but this is part of the update system and as such a bad idea to change
 - SSH seems to be setup to automatically SSH into pika, making it vulnerable to DNS hijacking if we know the key, but no reference to this is visible and also has a known host fingerprint that would be hard to fix
-- ***SSH is open to connections and does not block `root` nor does it use public/private key ... Pika Energy/Generac, this needs to change! ***
+
+> ***SSH is open to connections and does not block `root` nor does it use public/private key***
+> 
+> Pika Energy/Generac, this needs to change!
 
 ## Where to "insert" ourselves
 - We need to open the REST API on Port 80
