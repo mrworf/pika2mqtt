@@ -156,6 +156,10 @@ Cons:
 - Not persistent
 - Would make the vulnerability worse since we'd be publishing the password
 
+> All of the below is outdated, please look at the `SSH_HACK.md` for how we enable similar functionality these days.
+
+--------------------
+
 # How we fix this
 At this time, only the first option mentioned above makes sense and has the least impact. However, we need something which is unlikely to be affected by any updates. At the end of the day, we just need to let port 80 stay open for ethernet.
 
