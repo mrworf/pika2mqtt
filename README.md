@@ -4,31 +4,23 @@ This handy little tool will allow you to scrape the Pika website or the Pika inv
 
 It was created since I didn't particularly care for their website and because I do this with all other data sources around my house, and it would thus allow me to coalesce data points to create new features (like, if we generate enough power and the temperature is too high, start the AC even if we're not home, etc).
 
+Also, this is 100% local, no cloud involved.
+
 ## Usage
 
-It's really simple, it requires the URL to your pika profile. Unfortunately, because I'm lazy, you will have to make your solar system public so no login is required to access the details. Once this has been done, you "simply" run `pika2mqtt.py` with the following parameters:
+It's really simple, it requires the hostname of your pika inverter. Once this has been done, you "simply" run `pika2mqtt.py` with the following parameters:
 
 ### With the public profile information
 
-> *Currently broken, author uses installer mode and will not be fixing this*
-
-- url to your profile (for example, https://profiles.pika-energy.com/users/0123456789)
-- MQTT broker (for example, mqtt.local)
-- A base for all topics to be published, I use `house/energy`
-- Zero or more serials (all uppercase) which should be ignored
-
-A complete command line would look like this (using above information)
-
-```
-./pika2mqtt.py https://profiles.pika-energy.com/users/0123456789 mqtt.local house/energy
-```
+No longer supported
 
 ### With the Pika inverter in installer mode
 
-- url to your inverter, simply the IP/DNS name of it (for example, `http://my-inverter.domain.net` or `http://192.168.1.42`)
+- Hostname or IP of your inverter, simply the IP/DNS name of it (for example, `my-inverter.domain.net` or `192.168.1.42`)
 - MQTT broker (for example, `mqtt.local`)
 - A base for all topics to be published, I use `house/energy`
 - Zero or more serials (all uppercase) which should be ignored
+- Using `--idrsa` you can get the service to install/restart the SSH hack, see [INSTALLER.md](extras/INSTALLER.md)
 
 > For details on how to run installer mode, see [INSTALLER.md](extras/INSTALLER.md) in the `extras/` directory
 
@@ -60,7 +52,7 @@ There's also a couple of extra topics. The next one is simply an additon of all 
 house/energy/total_solar/output
 ```
 
-If you're using installer mode, it will also provide
+You also get grid and house
 ```
 house/energy/grid/output
 house/energy/grid/input
@@ -70,7 +62,7 @@ house/energy/house/input
 This uses the Current transformers (CT) which are clamped around the feed to your main panel and will show how much you consume from the grid (output) or sell to the grid (input). Likewise, house topic implies how much power your household is consuming.
 
 > ***NOTE***
-> These three topics will *only* be available if you run in installer mode and have CT installed properly (some installers will sometimes install them on the feed between the main panel and the inverter, which obviously will be a bit misleading).
+> These three topics will *only* work properly if you have CT installed properly (some installers will sometimes install them on the feed between the main panel and the inverter, which obviously will be a bit misleading).
 
 Now, when you combine this tool with [telegraf](https://www.influxdata.com/time-series-platform/telegraf/ "telegraf"), [influxDB](https://www.influxdata.com/products/influxdb-overview/ "influxDB") and [grafana](https://grafana.com/ "grafana"), you get nice looking items such as
 
@@ -78,6 +70,8 @@ Now, when you combine this tool with [telegraf](https://www.influxdata.com/time-
 
 ## Docker image
 
-To simplify things, you can also run this as a docker image. The arguments above are provided via environment variables URL, MQTT and BASETOPIC. You need to run it with a terminal (ie, `-t`) or it will not work
+To simplify things, you can also run this as a docker image. The arguments above are provided via environment variables HOSTNAME, MQTT and BASETOPIC. You need to run it with a terminal (ie, `-t`) or it will not work.
+
+Also, if you mount `id_rsa` file into `/key/id_rsa` then it will be able to monitor the service on the inverter and restart it if needed.
 
 The project is published on https://hub.docker.com/r/mrworf/pika2mqtt

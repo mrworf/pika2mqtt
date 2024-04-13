@@ -5,13 +5,12 @@ import requests
 import time
 import threading
 import argparse
-import re
-import sys
 from datetime import datetime, timezone
-
+import subprocess
+import os
 import paho.mqtt.client as mqtt
 
-REFRESH=60
+REFRESH=15
 
 class PikaState:
   class Status:
@@ -231,15 +230,16 @@ class Pika:
     return connected
 
 class PikaMonitor(threading.Thread):
-  def __init__(self, url, prefix, ignoreSerials=None, installerMode=False):
+  def __init__(self, hostname, prefix, ignoreSerials=None, idrsa=None):
     threading.Thread.__init__(self)
     self.daemon = True
-    self.url = url
+    self.hostname = hostname
+    self.url = f'http://{hostname}:8000'
     self.mqtt = None
     self.prefix = prefix
     self.ignore = ignoreSerials
+    self.idrsa = idrsa
     self.topics = {}
-    self.installerMode = installerMode
 
     if self.prefix[-1] != '/':
       self.prefix += '/'
@@ -255,7 +255,28 @@ class PikaMonitor(threading.Thread):
 
   def start(self, mqtt):
     self.mqtt = mqtt
+
+    # Ensure that we have the service up first
+    self.reconnect()
+
     threading.Thread.start(self)
+
+  def reconnect(self):
+    if not self.idrsa or not os.path.exists(self.idrsa):
+      return
+    
+    print('Trying to restart the service')
+    command = ['extras/keep_running.sh', self.hostname, self.idrsa]
+    try:
+      process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,text=True)
+      output, error = process.communicate()
+      return_code = process.returncode
+      print(f'Command {command} returned {return_code}')
+      print('Output:')
+      print(output)
+    except:
+      print('Failed to restart the service')
+    time.sleep(5) # Give it a chance
 
   def run(self):
     pika = Pika()
@@ -263,18 +284,16 @@ class PikaMonitor(threading.Thread):
     lastConnect = False
     while True:
       try:
-        url = self.url
-        if installer:
-          url = self.url + '/devices'
+        url = self.url + '/devices'
         result = requests.get(url)
       except requests.exceptions.ConnectionError:
         print('Connection error')
-        time.sleep(1)
+        self.reconnect()
         continue
 
       if result is None or result.status_code != 200:
         print('Failed to obtain result from URL')
-        time.sleep(REFRESH)
+        self.reconnect()
         continue
 
       j = result.json()
@@ -282,35 +301,36 @@ class PikaMonitor(threading.Thread):
 
       # Next, fetch the status of the inverter so we see the grid power
       inv = None
-      if self.installerMode:
-        inv = pika.find(type = PikaDevice.INVERTER)
-        if inv:
-          try:
-            result = requests.get(self.url + '/device/%d/model/inverter_status' % inv.modid)
-            if result is None or result.status_code != 200:
-              print('Failed to retrieve inverter info, result is: %d' % result.status_code)
-              print(repr(result.headers))
-              print(repr(result.text))
-              inv = None
-            else:
-              inv = result.json()
-              if not 'fixed' in inv or not 'CTPow' in inv['fixed']:
-                print('JSON doesnt hold all the fields we need')
-                print(repr(inv))
-                inv = None
-          except requests.exceptions.ConnectionError:
-            print('Connection error')
-            inv = None
-          except:
+      inv = pika.find(type = PikaDevice.INVERTER)
+      if inv:
+        try:
+          result = requests.get(self.hostname + '/device/%d/model/inverter_status' % inv.modid)
+          if result is None or result.status_code != 200:
             print('Failed to retrieve inverter info, result is: %d' % result.status_code)
             print(repr(result.headers))
             print(repr(result.text))
             inv = None
+          else:
+            inv = result.json()
+            if not 'fixed' in inv or not 'CTPow' in inv['fixed']:
+              print('JSON doesnt hold all the fields we need')
+              print(repr(inv))
+              inv = None
+        except requests.exceptions.ConnectionError:
+          print('Connection error')
+          inv = None
+        except:
+          print('Failed to retrieve inverter info, result is: %d' % result.status_code)
+          print(repr(result.headers))
+          print(repr(result.text))
+          inv = None
 
       connected = pika.isConnected()
 
       if not connected:
         print('WARNING! All information is stale, connection between inverter and pika backend is unavailable\n')
+        self.reconnect()
+
       if 'connected' not in topics or topics['connected'] != connected:
         print('Publishing new state (%d) for connected' % connected)
         self.mqtt.publish(self.prefix + 'connected', 1 if connected else 0)
@@ -350,24 +370,16 @@ class PikaMonitor(threading.Thread):
 
 parser = argparse.ArgumentParser(description="Pika-2-MQTT - Getting that data into your own system", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--logfile', metavar="FILE", help="Log to file instead of stdout")
-parser.add_argument('url', help='Public PIKA url (for example https://profiles.pika-energy.com/users/0123456789)')
+parser.add_argument('hostname', help='IP or FQDN of your pika system')
 parser.add_argument('mqtt', help='MQTT Broker to publish topics')
 parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<type>_<serial>/x where x is one of watt or state')
+parser.add_argument('--idrsa', default='/key/id_rsa', help='Path to the id_rsa file for the PIKA system (for monitoring)')
 parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
 cmdline = parser.parse_args()
 
-url = cmdline.url
-installer = True
-m = re.match('https://profiles.pika-energy.com/users/([0-9]+)', cmdline.url)
-if m is None:
-  print('URL "%s" is assumed to be a PIKA system in installer mode' % cmdline.url)
-else:
-  url = 'https://profiles.pika-energy.com/%s.json' % m.group(1)
-  installer = False
-
-client = mqtt.Client()
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.connect(cmdline.mqtt, 1883, 60)
 
-monitor = PikaMonitor(url, cmdline.basetopic, cmdline.ignore, installer)
+monitor = PikaMonitor(cmdline.hostname, cmdline.basetopic, cmdline.ignore, idrsa=cmdline.idrsa)
 monitor.start(client)
 client.loop_forever()

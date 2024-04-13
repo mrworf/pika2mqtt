@@ -4,12 +4,6 @@
 KEY=id_rsa
 HOST=localhost
 
-# Allow override of defaults with separate file
-if [ -f keep_running.conf ]; then
-	echo "Loading config..."
-	source keep_running.conf
-fi
-
 runcmd() {
 	ssh -i $KEY root@$HOST $@
 	local RET=$?
@@ -22,7 +16,22 @@ runcmd() {
 TEST=true
 EXITVALUE=0
 
-if [ "$1" != "test" ]; then
+HOST=$1
+KEY=$2
+
+PROXYSCRIPT="$(dirname "$0")/pika_proxy.py"
+
+if [ ! -f "$PROXYSCRIPT" ]; then
+	echo "Proxy script not found, must be in the same directory as this script"
+	exit 1
+fi
+
+if [ -z "$HOST" -o -z "$KEY" ]; then
+	echo "Usage: $0 <host> <key> [test]"
+	exit 1
+fi
+
+if [ "$3" != "test" ]; then
 	TEST=false
 fi
 
@@ -39,7 +48,7 @@ if $TEST; then
 fi
 
 # Ensure key is protected or SSH will fail
-chmod 600 id_rsa
+chmod 600 "$KEY"
 
 if ! runcmd iptables -L INPUT | grep -q 8000; then
 	echo "Firewall rule is missing, adding it..."
@@ -56,7 +65,7 @@ if ! runcmd ls | grep -q proxy; then
 	UPLOAD=true
 else
 	REMOTE_HASH=$(runcmd sha256sum /root/pika_proxy.py | awk '{print $1}')
-	LOCAL_HASH=$(sha256sum pika_proxy.py | awk '{print $1}')
+	LOCAL_HASH=$(sha256sum "$PROXYSCRIPT" | awk '{print $1}')
 	echo "Script present"
 	if [ "$REMOTE_HASH" != "$LOCAL_HASH" ]; then
 		echo "Script is outdated, will upload new"
@@ -76,7 +85,7 @@ fi
 
 if $UPLOAD; then
 	echo "Uploading script"
-	scp -i $KEY pika_proxy.py root@$HOST:/root/pika_proxy.py
+	scp -i $KEY "$PROXYSCRIPT" root@$HOST:/root/pika_proxy.py
 fi
 
 if $RESTART; then
