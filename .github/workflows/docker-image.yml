@@ -18,12 +18,11 @@ jobs:
       run: pip install paho-mqtt
     - name: Run pika2mqtt.py
       run: |
-        python3 pika2mqtt.py
-        ret=$?
-        if [ $ret -eq 2 ]; then 
-          exit 0
-        else 
-          exit $ret
-        fi
+        python3 -c "
+        import subprocess
+        ret = subprocess.run(['python3', 'pika2mqtt.py']).returncode
+        if ret != 2:
+            raise SystemExit(ret)
+        "
     - name: Build the Docker image
       run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)
