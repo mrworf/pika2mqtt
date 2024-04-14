@@ -41,5 +41,5 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           push: true
-          tags: ${{ secrets.USERNAME }}/pika2mqtt:latest
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/pika2mqtt:latest
           file: ./Dockerfile
