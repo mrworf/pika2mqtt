@@ -17,6 +17,13 @@ jobs:
     - name: Install dependencies
       run: pip install paho-mqtt
     - name: Run pika2mqtt.py
-      run: python3 pika2mqtt.py; ret=$?; if [ $ret -eq 2 ]; then exit 0; else exit $ret; fi
+      run: |
+        python3 pika2mqtt.py
+        ret=$?
+        if [ $ret -eq 2 ]; then 
+          exit 0
+        else 
+          exit $ret
+        fi
     - name: Build the Docker image
       run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)
