@@ -322,9 +322,12 @@ class PikaMonitor(threading.Thread):
         if entry.hasPower():
           self.publish(topic, 'output', entry.output)
           self.publish(topic, 'input', entry.input)
+          if kWh != None:
+            self.publish(topic, 'input_kwh', kWh if kWh < 0 else 0)
+            self.publish(topic, 'output_kwh', kWh if kWh > 0 else 0)
         self.publish(topic, 'power', entry.power)
         if kWh != None:
-          self.publish(topic, 'kwh', kWh)
+          self.publish(topic, 'power_kwh', kWh)
 
         if entry.type == PikaDevice.BATTERY:
           self.publish(topic, 'charge', int(entry.charge*10))
@@ -335,9 +338,10 @@ class PikaMonitor(threading.Thread):
       # Publish a total solar as well (if it changed)
       if total_solar != last_solar:
         last_solar = total_solar
-        self.publish('solar_total', 'output', total_solar)
         self.publish('solar_total', 'power', total_solar)
-        self.publish('solar_total', 'kwh', kWh)
+        self.publish('solar_total', 'power_kwh', kWh)
+        self.publish('solar_total', 'output', total_solar)
+        self.publish('solar_total', 'output_kwh', kWh if kWh > 0 else 0)
 
       logging.debug(f'Total solar: {total_solar}W ({kWh}kWh)')
 
