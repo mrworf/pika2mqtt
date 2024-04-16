@@ -73,12 +73,28 @@ class PikaDevice:
   LOAD = 6
   BEACON = 7
   UNKNOWN = 0
+  GRIDTIE = 8
 
-  def __init__(self, rcpn, entry):
-    self._timestamp = None
-    self._rcpn = rcpn
-    self.noupdate = 0
-    self.update(entry)
+  def __init__(self, rcpn, entry, power = None):
+    if power is None:
+      self._timestamp = None
+      self._rcpn = rcpn
+      self.noupdate = 0
+      self.update(entry)
+    else:
+      self._timestamp = int(time.time())
+      self._rcpn = 'DEADCAFEBEEF'
+      self.noupdate = 0
+      self.type = PikaDevice.GRIDTIE
+      self.serial = self._rcpn
+      self.name = 'grid'
+      self.state = 0
+      self.output = max(0,power)
+      self.input = abs(min(0, power))
+      self.power = power
+      self.charge = 0
+      self.modid = -1
+      self.lastupdate = self._timestamp
 
   def update(self, data):
     # Locate the device info we need
@@ -109,7 +125,7 @@ class PikaDevice:
     return PikaState.DEFINITIONS['UNDEFINED']
 
   def getTypeName(self):
-    types = ['Unknown', 'Wind', 'Inverter', 'Solar', 'Weatherstation', 'Battery', 'Load', 'Beacon']
+    types = ['Unknown', 'Wind', 'Inverter', 'Solar', 'Weatherstation', 'Battery', 'Load', 'Beacon', 'Gridtie']
     return types[max(0, min(len(types)-1, self.type))]
 
   def hasPower(self):
@@ -127,6 +143,8 @@ class PikaDevice:
     return PikaDevice.UNKNOWN
 
 class Pika:
+  IGNORE_TYPES = [PikaDevice.BEACON, PikaDevice.UNKNOWN, PikaDevice.WEATHERSTATION]
+
   def __init__(self):
     self.devices = []
 
@@ -152,7 +170,12 @@ class Pika:
               self.devices[e].update(data)
               break
           if not found:
-            self.devices.append(PikaDevice(i['rcpn'], data))
+            device = PikaDevice(i['rcpn'], data)
+            if device.type not in Pika.IGNORE_TYPES:
+              self.devices.append(device)
+
+  def add_gridtie(self, power):
+    self.devices.append(PikaDevice(None, None, power=power))
 
 class PikaMonitor(threading.Thread):
   def __init__(self, hostname, prefix, ignoreSerials=None, idrsa=None):
@@ -182,7 +205,7 @@ class PikaMonitor(threading.Thread):
       logging.warning('No id_rsa file found, cannot restart the service')
       return
     
-    logging.debug('Trying to restart the service')
+    logging.info('Trying to restart the service')
     command = ['extras/keep_running.sh', self.hostname, self.idrsa]
     try:
       process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,text=True)
@@ -190,7 +213,12 @@ class PikaMonitor(threading.Thread):
       return_code = process.returncode
       logging.debug(f'Command {command} returned {return_code}')
       logging.debug('Output:')
-      logging.debug(output)
+      for line in output.split('\n'):
+        logging.debug(line)
+      if return_code != 0:
+        logging.error(f'Failed to restart the service: {output}')
+      else:
+        logging.info('Service restarted')
     except:
       logging.exception('Failed to restart the service')
     time.sleep(5) # Give it a chance
@@ -226,10 +254,13 @@ class PikaMonitor(threading.Thread):
         tie = result.json()
         if 'fixed' in tie and 'CTPow' in tie['fixed']:
           return tie['fixed']['CTPow']
+        else:
+          logging.error(f'Failed to obtain gridtie information.')
     except requests.exceptions.ConnectionError:
       logging.exception('Failed to connect to URL')
     except:
       logging.exception('Failed to obtain gridtie information')
+    logging.warning('No gridtie information found')
     return None
 
   def publish(self, topic, key, value):
@@ -237,25 +268,27 @@ class PikaMonitor(threading.Thread):
     self.mqtt.publish(topic + '/' + key, value)
 
   def run(self):
-    gridtie = None # Will always be realtime
-    prev_gridtie = None
-    last_gridtie = 0
-
     last_update = {} # Track the last update time for each device
-
+    last_solar = 0
+    power = None
+    logging.info('Starting the monitor')
     while True:
       total_solar = 0
-      print("\033[2J\033[H")
       # First, fetch the devices
       pika = self.load_devices()
 
       # Next, fetch the inverter id so we can get the gridtie information
       inv = pika.find(type = PikaDevice.INVERTER)
       if inv:
-        gridtie = self.load_gridtie(inv.modid)
-        last_gridtie = int(time.time())
+        power = self.load_gridtie(inv.modid)
+        if power != None:
+          pika.add_gridtie(power)
+      else:
+        logging.warning('No inverter found, trying to restart the service')
+        self.reconnect()
+        continue
 
-      if not pika and not gridtie:
+      if not pika and not power:
         logging.warning('No devices found, trying to restart the service')
         self.publish('connected', 'state', 0)
         self.reconnect()
@@ -271,57 +304,42 @@ class PikaMonitor(threading.Thread):
           last_update[entry.serial] = 0
         if entry.lastupdate > last_update[entry.serial]:
           skip = False
+
         # Calculate the kWh
         kWh = None
         if not skip and last_update[entry.serial] > 0:
-          #print('Calc %d - %d = %d' % (entry.lastupdate, last_update[entry.serial], entry.lastupdate - last_update[entry.serial]))
-          kWh = (entry.output * (entry.lastupdate - last_update[entry.serial])) / 3600
-          if kWh < 0:
-            print(f'Negative kWh for {entry.serial} ({kWh}), entry.lastupdate={entry.lastupdate}, last_update={last_update[entry.serial]}')
-            sys.exit(1)
+          kWh = (entry.power * (entry.lastupdate - last_update[entry.serial])) / 3600
 
-        print('%1s %10d | %8d | %2.1f | %s | %20s | %10d | %s' % ('' if skip else '*', entry.lastupdate, entry.output, entry.charge, entry.serial, f'{entry.name} [{entry.getTypeName()}]', last_update[entry.serial], ('%.5f' % kWh) if kWh != None else 'Not available'))
+        logging.debug('%1s %10d | %8d | %2.1f | %s | %20s | %10d | %s' % ('' if skip else '*', entry.lastupdate, entry.power, entry.charge, entry.serial, f'{entry.name} [{entry.getTypeName()}]', last_update[entry.serial], ('%.5f' % kWh) if kWh != None else 'Not available'))
         last_update[entry.serial] = entry.lastupdate
         if skip:
           continue
+
         topic = ('%s_%s' % (entry.getTypeName(), entry.serial)).lower()
         if entry.type == PikaDevice.SOLAR:
           total_solar += entry.output
 
-        self.publish(topic, 'state', entry.state)
-
         if entry.hasPower():
           self.publish(topic, 'output', entry.output)
           self.publish(topic, 'input', entry.input)
+        self.publish(topic, 'power', entry.power)
+        if kWh != None:
+          self.publish(topic, 'kwh', kWh)
 
         if entry.type == PikaDevice.BATTERY:
           self.publish(topic, 'charge', int(entry.charge*10))
 
-      # Publish a total solar output index as well
-      self.publish('solar_total', 'output', total_solar)
+      # Do an estimation on the amount of kWh produced by the solar array
+      kWh = (total_solar) / 3600
 
-      kWh = None
-      if gridtie:
-        self.publish('grid', 'export', abs(min(0, gridtie)))
-        self.publish('grid', 'import', max(0, gridtie))
-        self.publish('grid', 'power', gridtie)
-      elif prev_gridtie:
-        self.publish('grid', 'export', 0)
-        self.publish('grid', 'import', 0)
-        self.publish('grid', 'power', 0)
-      prev_gridtie = gridtie
-      print('%10d | %8d | %2.1f | %12s | %20s | %10d | %s' % (0, gridtie, 0, '', 'Grid Tie', 0, ''))
+      # Publish a total solar as well (if it changed)
+      if total_solar != last_solar:
+        last_solar = total_solar
+        self.publish('solar_total', 'output', total_solar)
+        self.publish('solar_total', 'power', total_solar)
+        self.publish('solar_total', 'kwh', kWh)
 
-      # Calculate the some meta data as well:
-      # - Total solar output
-      # - Total house usage
-      # - Inverter loss
-
-      dev = pika.find(type = PikaDevice.INVERTER)
-      if dev:
-        # Calculate the power that the house is using
-        #self.publish('house', 'input', dev.output - ctpow)
-        pass
+      logging.debug(f'Total solar: {total_solar}W ({kWh}kWh)')
 
       time.sleep(1)
 
@@ -329,13 +347,21 @@ class PikaMonitor(threading.Thread):
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 parser = argparse.ArgumentParser(description="Pika-2-MQTT - Getting that data into your own system", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--logfile', metavar="FILE", help="Log to file instead of stdout")
 parser.add_argument('hostname', help='IP or FQDN of your pika system')
 parser.add_argument('mqtt', help='MQTT Broker to publish topics')
 parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<type>_<serial>/x where x is one of watt or state')
 parser.add_argument('--idrsa', default='/key/id_rsa', help='Path to the id_rsa file for the PIKA system (for monitoring)')
 parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
+parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+
 cmdline = parser.parse_args()
+
+if cmdline.debug:
+  logging.getLogger().setLevel(logging.DEBUG)
+
+if not cmdline.hostname or not cmdline.mqtt or not cmdline.basetopic:
+  parser.print_help()
+  exit(1)
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.connect(cmdline.mqtt, 1883, 60)
