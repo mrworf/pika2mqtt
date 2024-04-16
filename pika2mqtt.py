@@ -269,7 +269,7 @@ class PikaMonitor(threading.Thread):
 
   def run(self):
     last_update = {} # Track the last update time for each device
-    last_solar = 0
+    last_solar = -1
     power = None
     logging.info('Starting the monitor')
     while True:
