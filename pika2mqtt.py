@@ -230,6 +230,9 @@ class PikaMonitor(threading.Thread):
     except requests.exceptions.ConnectionError:
       logging.exception('Failed to connect to URL')
       return None
+    except:
+      logging.exception('Failed to get devices')
+      return None
 
     if result is None or result.status_code != 200:
       logging.error(f'Failed to obtain devices.')
@@ -276,6 +279,10 @@ class PikaMonitor(threading.Thread):
       total_solar = 0
       # First, fetch the devices
       pika = self.load_devices()
+      if pika is None:
+        logging.warning('No devices found, trying to restart the service')
+        self.reconnect()
+        continue
 
       # Next, fetch the inverter id so we can get the gridtie information
       inv = pika.find(type = PikaDevice.INVERTER)
