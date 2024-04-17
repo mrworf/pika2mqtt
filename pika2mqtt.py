@@ -330,7 +330,7 @@ class PikaMonitor(threading.Thread):
           self.publish(topic, 'output', entry.output)
           self.publish(topic, 'input', entry.input)
           if kWh != None:
-            self.publish(topic, 'input_kwh', kWh if kWh < 0 else 0)
+            self.publish(topic, 'input_kwh', abs(kWh) if kWh < 0 else 0)
             self.publish(topic, 'output_kwh', kWh if kWh > 0 else 0)
         self.publish(topic, 'power', entry.power)
         if kWh != None:
