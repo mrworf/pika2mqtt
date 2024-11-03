@@ -226,7 +226,7 @@ class PikaMonitor(threading.Thread):
   def load_devices(self):
     try:
       url = self.url + '/devices'
-      result = requests.get(url, timeout=0.5)
+      result = requests.get(url, timeout=5)
     except requests.exceptions.ConnectionError:
       logging.exception('Failed to connect to URL')
       return None
@@ -248,7 +248,7 @@ class PikaMonitor(threading.Thread):
 
   def load_gridtie(self, id):
     try:
-      result = requests.get(self.url + '/device/%d/model/inverter_status' % id)
+      result = requests.get(self.url + '/device/%d/model/inverter_status' % id, timeout=5)
       if result is None or result.status_code != 200:
         logging.error(f'Failed to obtain gridtie information.')
         if result:
@@ -360,6 +360,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 parser = argparse.ArgumentParser(description="Pika-2-MQTT - Getting that data into your own system", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('hostname', help='IP or FQDN of your pika system')
 parser.add_argument('mqtt', help='MQTT Broker to publish topics')
+parser.add_argument('--user', help='MQTT Broker user')
+parser.add_argument('--password', help='MQTT Broker password')
 parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<type>_<serial>/x where x is one of watt or state')
 parser.add_argument('--idrsa', default='/key/id_rsa', help='Path to the id_rsa file for the PIKA system (for monitoring)')
 parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
@@ -375,6 +377,10 @@ if not cmdline.hostname or not cmdline.mqtt or not cmdline.basetopic:
   exit(1)
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+if cmdline.user and cmdline.password:
+  client.username_pw_set(cmdline.user, cmdline.password)
+else:
+  logging.warning('Not using MQTT authentication')
 client.connect(cmdline.mqtt, 1883, 60)
 
 monitor = PikaMonitor(cmdline.hostname, cmdline.basetopic, cmdline.ignore, idrsa=cmdline.idrsa)
