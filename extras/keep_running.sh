@@ -5,7 +5,7 @@ KEY=id_rsa
 HOST=localhost
 
 runcmd() {
-	ssh -i $KEY root@$HOST $@
+	ssh -i $KEY -o BatchMode=yes -o StrictHostKeyChecking=no root@$HOST $@
 	local RET=$?
 	if [ $RET -ne 0 ]; then
 		echo "Command failed with $RET"
