@@ -5,13 +5,16 @@ import requests
 import time
 import threading
 import argparse
-from datetime import datetime, timezone
-import subprocess
 import os
-import paho.mqtt.client as mqtt
 import logging
-import time
-import os
+import signal
+import sys
+
+from pika_transport import (
+  SshTunnelConfig,
+  SshTunnelSupervisor,
+  TransportConfigurationError,
+)
 
 REFRESH=15
 
@@ -178,57 +181,44 @@ class Pika:
     self.devices.append(PikaDevice(None, None, power=power))
 
 class PikaMonitor(threading.Thread):
-  def __init__(self, hostname, prefix, ignoreSerials=None, idrsa=None):
+  def __init__(self, base_url, prefix, ignoreSerials=None, transport=None):
     threading.Thread.__init__(self)
     self.daemon = True
-    self.hostname = hostname
-    self.url = f'http://{hostname}:8000'
+    self.url = base_url
     self.mqtt = None
     self.prefix = prefix
-    self.ignore = ignoreSerials
-    self.idrsa = idrsa
+    self.ignore = ignoreSerials or []
+    self.transport = transport
     self.topics = {}
+    self.stop_event = threading.Event()
 
     if self.prefix[-1] != '/':
       self.prefix += '/'
 
   def start(self, mqtt):
     self.mqtt = mqtt
-
-    # Ensure that we have the service up first
-    self.reconnect()
-
     threading.Thread.start(self)
 
-  def reconnect(self):
-    if not self.idrsa or not os.path.exists(self.idrsa):
-      logging.warning('No id_rsa file found, cannot restart the service')
-      return
-    
-    logging.info('Trying to restart the service')
-    command = ['extras/keep_running.sh', self.hostname, self.idrsa]
+  def stop(self):
+    self.stop_event.set()
+
+  def _request(self, url):
     try:
-      process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,text=True)
-      output, error = process.communicate()
-      return_code = process.returncode
-      logging.debug(f'Command {command} returned {return_code}')
-      logging.debug('Output:')
-      for line in output.split('\n'):
-        logging.debug(line)
-      if return_code != 0:
-        logging.error(f'Failed to restart the service: {output}')
-      else:
-        logging.info('Service restarted')
-    except:
-      logging.exception('Failed to restart the service')
-    time.sleep(5) # Give it a chance
+      result = requests.get(url, timeout=5)
+      if self.transport:
+        self.transport.report_success()
+      return result
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
+      if self.transport:
+        self.transport.report_transport_failure(error)
+      raise
 
   def load_devices(self):
     try:
       url = self.url + '/devices'
-      result = requests.get(url, timeout=5)
-    except requests.exceptions.ConnectionError:
-      logging.exception('Failed to connect to URL')
+      result = self._request(url)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+      logging.warning('Failed to connect to devices endpoint')
       return None
     except:
       logging.exception('Failed to get devices')
@@ -248,7 +238,7 @@ class PikaMonitor(threading.Thread):
 
   def load_gridtie(self, id):
     try:
-      result = requests.get(self.url + '/device/%d/model/inverter_status' % id, timeout=5)
+      result = self._request(self.url + '/device/%d/model/inverter_status' % id)
       if result is None or result.status_code != 200:
         logging.error(f'Failed to obtain gridtie information.')
         if result:
@@ -259,8 +249,8 @@ class PikaMonitor(threading.Thread):
           return tie['fixed']['CTPow']
         else:
           logging.error(f'Failed to obtain gridtie information.')
-    except requests.exceptions.ConnectionError:
-      logging.exception('Failed to connect to URL')
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+      logging.warning('Failed to connect to inverter status endpoint')
     except:
       logging.exception('Failed to obtain gridtie information')
     logging.warning('No gridtie information found')
@@ -275,13 +265,15 @@ class PikaMonitor(threading.Thread):
     last_solar = -1
     power = None
     logging.info('Starting the monitor')
-    while True:
+    while not self.stop_event.is_set():
+      if self.transport and not self.transport.wait_available(timeout=1):
+        continue
       total_solar = 0
       # First, fetch the devices
       pika = self.load_devices()
       if pika is None:
-        logging.warning('No devices found, trying to restart the service')
-        self.reconnect()
+        logging.warning('No devices found; waiting for installer transport')
+        self.stop_event.wait(1)
         continue
 
       # Next, fetch the inverter id so we can get the gridtie information
@@ -291,14 +283,14 @@ class PikaMonitor(threading.Thread):
         if power != None:
           pika.add_gridtie(power)
       else:
-        logging.warning('No inverter found, trying to restart the service')
-        self.reconnect()
+        logging.warning('No inverter found in device response')
+        self.stop_event.wait(1)
         continue
 
       if not pika and not power:
-        logging.warning('No devices found, trying to restart the service')
+        logging.warning('No devices found in installer response')
         self.publish('connected', 'state', 0)
-        self.reconnect()
+        self.stop_event.wait(1)
         continue
       else:
         self.publish('connected', 'state', 1)
@@ -352,37 +344,92 @@ class PikaMonitor(threading.Thread):
 
       logging.debug(f'Total solar: {total_solar}W ({kWh}kWh)')
 
-      time.sleep(1)
+      self.stop_event.wait(1)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-parser = argparse.ArgumentParser(description="Pika-2-MQTT - Getting that data into your own system", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('hostname', help='IP or FQDN of your pika system')
-parser.add_argument('mqtt', help='MQTT Broker to publish topics')
-parser.add_argument('--user', help='MQTT Broker user')
-parser.add_argument('--password', help='MQTT Broker password')
-parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<type>_<serial>/x where x is one of watt or state')
-parser.add_argument('--idrsa', default='/key/id_rsa', help='Path to the id_rsa file for the PIKA system (for monitoring)')
-parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
-parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+def build_parser():
+  parser = argparse.ArgumentParser(description="Pika-2-MQTT - Getting that data into your own system", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser.add_argument('hostname', help='IP or FQDN of your pika system')
+  parser.add_argument('mqtt', help='MQTT Broker to publish topics')
+  parser.add_argument('--user', help='MQTT Broker user')
+  parser.add_argument('--password', help='MQTT Broker password')
+  parser.add_argument('basetopic', help='What base topic to use, is prefixed to /<type>_<serial>/x where x is one of watt or state')
+  parser.add_argument('--idrsa', default='/key/id_rsa', help='Path to the root SSH key for the Pika system')
+  parser.add_argument('--ssh-host-fingerprint', default=os.getenv('SSH_HOST_FINGERPRINT'), help='Expected SHA-256 SSH host-key fingerprint')
+  parser.add_argument('--ssh-port', type=int, default=int(os.getenv('SSH_PORT', '22')), help='Inverter SSH port')
+  parser.add_argument('--ssh-local-port', type=int, default=int(os.getenv('SSH_LOCAL_PORT', '18080')), help='Loopback port used by the SSH tunnel')
+  parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
+  parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+  return parser
 
-cmdline = parser.parse_args()
 
-if cmdline.debug:
-  logging.getLogger().setLevel(logging.DEBUG)
+def main(argv=None):
+  try:
+    import paho.mqtt.client as mqtt
+  except ImportError:
+    logging.critical('Missing runtime dependency: paho-mqtt')
+    return 2
 
-if not cmdline.hostname or not cmdline.mqtt or not cmdline.basetopic:
-  parser.print_help()
-  exit(1)
+  parser = build_parser()
+  cmdline = parser.parse_args(argv)
 
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-if cmdline.user and cmdline.password:
-  client.username_pw_set(cmdline.user, cmdline.password)
-else:
-  logging.warning('Not using MQTT authentication')
-client.connect(cmdline.mqtt, 1883, 60)
+  if cmdline.debug:
+    logging.getLogger().setLevel(logging.DEBUG)
 
-monitor = PikaMonitor(cmdline.hostname, cmdline.basetopic, cmdline.ignore, idrsa=cmdline.idrsa)
-monitor.start(client)
-client.loop_forever()
+  tunnel = SshTunnelSupervisor(SshTunnelConfig(
+    hostname=cmdline.hostname,
+    private_key=cmdline.idrsa,
+    host_fingerprint=cmdline.ssh_host_fingerprint,
+    ssh_port=cmdline.ssh_port,
+    local_port=cmdline.ssh_local_port,
+  ))
+  try:
+    tunnel.start()
+  except TransportConfigurationError as error:
+    logging.critical('%s', error)
+    return 2
+
+  client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+  if cmdline.user and cmdline.password:
+    client.username_pw_set(cmdline.user, cmdline.password)
+  else:
+    logging.warning('Not using MQTT authentication')
+
+  monitor = PikaMonitor(tunnel.base_url, cmdline.basetopic, cmdline.ignore, transport=tunnel)
+
+  def shutdown(signum=None, frame=None):
+    if signum is not None:
+      logging.info('Received signal %d, shutting down', signum)
+    monitor.stop()
+    client.disconnect()
+
+  previous_handlers = {}
+  if threading.current_thread() is threading.main_thread():
+    for signum in (signal.SIGTERM, signal.SIGINT):
+      previous_handlers[signum] = signal.signal(signum, shutdown)
+
+  def watch_fatal_transport():
+    if tunnel.wait_fatal():
+      logging.critical('SSH tunnel stopped: %s', tunnel.fatal_error)
+      client.disconnect()
+
+  fatal_watcher = threading.Thread(target=watch_fatal_transport, daemon=True)
+  fatal_watcher.start()
+
+  try:
+    client.connect(cmdline.mqtt, 1883, 60)
+    monitor.start(client)
+    client.loop_forever()
+  finally:
+    monitor.stop()
+    tunnel.stop()
+    for signum, previous in previous_handlers.items():
+      signal.signal(signum, previous)
+
+  return 1 if tunnel.fatal_error else 0
+
+
+if __name__ == '__main__':
+  sys.exit(main())

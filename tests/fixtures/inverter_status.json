@@ -1,0 +1,14 @@
+{
+  "fixed": {
+    "CTPow": -1434,
+    "EnableBits": 18003,
+    "ErrorWord": 0,
+    "LineStatus": 4096,
+    "RelayStatus": 12884,
+    "StatusWord": 45087,
+    "SysMd": 3,
+    "WhIn": 69536122,
+    "WhOut": 41897940
+  },
+  "repeating": {}
+}

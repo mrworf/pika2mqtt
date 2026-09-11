@@ -1,0 +1,7 @@
+{
+  "batt": [{"lastheard": 3, "modID": 10, "power": 0, "rcpn": "000100080001", "soc": 29.9, "type": "batt"}],
+  "inv": [{"lastheard": 1, "modID": 9, "power": -25, "rcpn": "000100070001", "type": "inv"}],
+  "lcm": [{"lastheard": 0, "modID": 1, "power": 0, "rcpn": "000100120001", "type": "lcm"}],
+  "pv": [{"lastheard": 2, "modID": 3, "power": 312, "rcpn": "000100030001", "type": "pv"}],
+  "version": "1.8.2"
+}
