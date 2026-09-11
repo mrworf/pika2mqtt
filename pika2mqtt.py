@@ -15,8 +15,26 @@ from pika_transport import (
   SshTunnelSupervisor,
   TransportConfigurationError,
 )
+from web_gateway import (
+  GatewayConfigurationError,
+  InstallerWebGateway,
+  WebGatewayConfig,
+  resolve_web_password,
+)
 
 REFRESH=15
+
+
+def environment_flag(name, default=False):
+  value = os.getenv(name)
+  if value is None:
+    return default
+  normalized = value.strip().lower()
+  if normalized in ('1', 'true', 'yes', 'on'):
+    return True
+  if normalized in ('0', 'false', 'no', 'off', ''):
+    return False
+  raise GatewayConfigurationError(f'{name} must be true or false')
 
 class PikaState:
   class Status:
@@ -360,6 +378,12 @@ def build_parser():
   parser.add_argument('--ssh-host-fingerprint', default=os.getenv('SSH_HOST_FINGERPRINT'), help='Expected SHA-256 SSH host-key fingerprint')
   parser.add_argument('--ssh-port', type=int, default=int(os.getenv('SSH_PORT', '22')), help='Inverter SSH port')
   parser.add_argument('--ssh-local-port', type=int, default=int(os.getenv('SSH_LOCAL_PORT', '18080')), help='Loopback port used by the SSH tunnel')
+  parser.add_argument('--web', action='store_true', default=environment_flag('WEB_ENABLED'), help='Enable the authenticated installer web gateway')
+  parser.add_argument('--web-write', action='store_true', default=environment_flag('WEB_WRITE_ENABLED'), help='Allow write methods through the web gateway')
+  parser.add_argument('--web-listen', default=os.getenv('WEB_LISTEN', '0.0.0.0'), help='Web gateway listen address')
+  parser.add_argument('--web-port', type=int, default=int(os.getenv('WEB_PORT', '8000')), help='Web gateway listen port')
+  parser.add_argument('--web-user', default=os.getenv('WEB_USERNAME'), help='Web gateway Basic Auth username')
+  parser.add_argument('--web-password-file', default=os.getenv('WEB_PASSWORD_FILE'), help='File containing the web gateway password')
   parser.add_argument('ignore', nargs='*', help='Serial of devices to ignore')
   parser.add_argument('--debug', action='store_true', help='Enable debug logging')
   return parser
@@ -372,11 +396,35 @@ def main(argv=None):
     logging.critical('Missing runtime dependency: paho-mqtt')
     return 2
 
-  parser = build_parser()
+  try:
+    parser = build_parser()
+  except (GatewayConfigurationError, ValueError) as error:
+    logging.critical('%s', error)
+    return 2
   cmdline = parser.parse_args(argv)
 
   if cmdline.debug:
     logging.getLogger().setLevel(logging.DEBUG)
+
+  try:
+    web_password = None
+    if cmdline.web:
+      web_password = resolve_web_password(
+        cmdline.web_password_file, os.getenv('WEB_PASSWORD')
+      )
+    web_config = WebGatewayConfig(
+      enabled=cmdline.web,
+      allow_writes=cmdline.web_write,
+      listen_address=cmdline.web_listen,
+      listen_port=cmdline.web_port,
+      username=cmdline.web_user,
+      password=web_password,
+      upstream_port=cmdline.ssh_local_port,
+    )
+    web_config.validate()
+  except GatewayConfigurationError as error:
+    logging.critical('%s', error)
+    return 2
 
   tunnel = SshTunnelSupervisor(SshTunnelConfig(
     hostname=cmdline.hostname,
@@ -389,6 +437,14 @@ def main(argv=None):
     tunnel.start()
   except TransportConfigurationError as error:
     logging.critical('%s', error)
+    return 2
+
+  gateway = InstallerWebGateway(web_config, tunnel)
+  try:
+    gateway.start()
+  except GatewayConfigurationError as error:
+    logging.critical('%s', error)
+    tunnel.stop()
     return 2
 
   client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -416,14 +472,15 @@ def main(argv=None):
       client.disconnect()
 
   fatal_watcher = threading.Thread(target=watch_fatal_transport, daemon=True)
-  fatal_watcher.start()
 
   try:
     client.connect(cmdline.mqtt, 1883, 60)
+    fatal_watcher.start()
     monitor.start(client)
     client.loop_forever()
   finally:
     monitor.stop()
+    gateway.stop()
     tunnel.stop()
     for signum, previous in previous_handlers.items():
       signal.signal(signum, previous)
