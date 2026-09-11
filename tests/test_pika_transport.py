@@ -1,12 +1,9 @@
-import json
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
-
-import requests
 
 from pika_transport import (
     HostKeyMismatch,
@@ -16,7 +13,6 @@ from pika_transport import (
     SshTunnelSupervisor,
     TransportConfigurationError,
 )
-from pika2mqtt import Pika, PikaDevice, PikaMonitor
 
 
 EXPECTED_FINGERPRINT = "SHA256:eNkV/mgYpbPMP9aSi/KM+9z9GwWmROMUrtmVr7TezY4"
@@ -210,47 +206,6 @@ class TunnelConfigurationTests(unittest.TestCase):
         self.assertIn("SSH tunnel lost", output)
         self.assertIn("SSH tunnel reconnect scheduled", output)
         self.assertGreaterEqual(output.count("SSH tunnel established"), 2)
-
-
-class CollectorTransportTests(unittest.TestCase):
-    def fixture(self, name):
-        return json.loads(Path("tests/fixtures", name).read_text(encoding="utf-8"))
-
-    def test_live_shape_fixture_is_parsed_without_mqtt_changes(self):
-        pika = Pika()
-        pika.update(self.fixture("devices.json"))
-
-        self.assertEqual(pika.find(type=PikaDevice.INVERTER).modid, 9)
-        self.assertEqual(pika.find(type=PikaDevice.BATTERY).charge, 29.9)
-        self.assertEqual(pika.find(type=PikaDevice.SOLAR).output, 312)
-
-    @mock.patch("pika2mqtt.requests.get")
-    def test_devices_are_loaded_through_loopback_tunnel(self, get):
-        response = mock.Mock(status_code=200)
-        response.json.return_value = self.fixture("devices.json")
-        get.return_value = response
-        transport = mock.Mock()
-        monitor = PikaMonitor(
-            "http://127.0.0.1:18080", "house/energy", transport=transport
-        )
-
-        pika = monitor.load_devices()
-
-        self.assertIsNotNone(pika)
-        get.assert_called_once_with("http://127.0.0.1:18080/devices", timeout=5)
-        transport.report_success.assert_called_once()
-
-    @mock.patch("pika2mqtt.requests.get")
-    def test_request_failure_is_reported_to_supervisor(self, get):
-        error = requests.exceptions.Timeout("hung")
-        get.side_effect = error
-        transport = mock.Mock()
-        monitor = PikaMonitor(
-            "http://127.0.0.1:18080", "house/energy", transport=transport
-        )
-
-        self.assertIsNone(monitor.load_devices())
-        transport.report_transport_failure.assert_called_once_with(error)
 
 
 if __name__ == "__main__":

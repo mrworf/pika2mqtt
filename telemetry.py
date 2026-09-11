@@ -156,6 +156,20 @@ PVRSS_SELF_TEST_RESULTS = {
     8: "vlow_low",
 }
 PVRSS_FAILURE_RESULTS = {1, 3, 4, 5, 7, 8}
+PV_ERROR_BITS = (
+    "hardware_arc_fault",
+    "reverse_current",
+    "input_over_current",
+    "input_over_voltage",
+    "ground_fault_test_failed",
+    "low_input_impedance",
+    "flash_crc_failed",
+    "eeprom_crc_failed",
+    "spt_crc_failed",
+    "over_temperature",
+    "dead_fet",
+    "hardware_version_mismatch",
+)
 
 
 def decode_rebus_state(value: Any) -> dict[str, Any]:
@@ -315,6 +329,10 @@ class InstallerTelemetry:
             self._read_details(now)
         return self._snapshot(now)
 
+    def current_snapshot(self) -> dict[str, Any]:
+        """Age the last observation without touching an unavailable transport."""
+        return self._snapshot(self.clock())
+
     def _base_device(self, serial: str, kind: str, now: float) -> dict[str, Any]:
         source = self._last_devices.get(serial)
         present = source is not None
@@ -343,9 +361,11 @@ class InstallerTelemetry:
         return state
 
     def _apply_rebus(self, state: dict[str, Any]) -> None:
+        common = _fixed(state.get("raw_models", {}).get("common"))
         rebus = _fixed(state.get("raw_models", {}).get("REbus_status"))
         state.update(decode_rebus_state(rebus.get("St")))
         state.update({
+            "firmware_version": common.get("Vr"),
             "rebus_power_w": _number(rebus, "P"),
             "accumulated_energy_kwh": (_number(rebus, "E") / 1000) if _number(rebus, "E") is not None else None,
             "voltage_v": _number(rebus, "V"),
@@ -376,12 +396,19 @@ class InstallerTelemetry:
             "number_of_strings": _number(pvrss, "NumStrings"),
             "telemetry_updated_at": pvrss.get("LastUpdatedUTCTimestamp"),
         })
-        state["fault"] = bool(
-            state["status_severity"] == "error"
-            or state["error_word"]
-            or result_number in PVRSS_FAILURE_RESULTS
-            or pvrss.get("LockoutError")
-        )
+        state["error_names"] = [
+            name for bit, name in enumerate(PV_ERROR_BITS) if state["error_word"] & (1 << bit)
+        ]
+        fault_reasons = list(state["error_names"])
+        if state["status_severity"] == "error":
+            fault_reasons.append(state["status"])
+        if result_number in PVRSS_FAILURE_RESULTS:
+            fault_reasons.append(f"pvrss_{state['pvrss_self_test']}")
+        if pvrss.get("LockoutError"):
+            fault_reasons.append("pvrss_lockout")
+        state["fault_reasons"] = sorted(set(fault_reasons))
+        state["fault_summary"] = ", ".join(state["fault_reasons"]) or "none"
+        state["fault"] = bool(state["fault_reasons"])
         return state
 
     def _generic_state(self, serial: str, kind: str, now: float) -> dict[str, Any]:
