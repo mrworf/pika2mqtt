@@ -1,77 +1,170 @@
-# Pika To MQTT
+# Pika to MQTT
 
-This handy little tool will allow you to scrape the Pika website or the Pika inverter itself (if you run it in installer mode) and publish it via MQTT protocol.
+Pika to MQTT reads a Pika Energy/Generac PWRcell inverter's local installer API
+and publishes its power data to MQTT. Everything stays on the local network; no
+Generac cloud service is involved.
 
-It was created since I didn't particularly care for their website and because I do this with all other data sources around my house, and it would thus allow me to coalesce data points to create new features (like, if we generate enough power and the temperature is too high, start the AC even if we're not home, etc).
+Generac only permits the installer site to be reached from localhost or its
+provisioning network. Pika to MQTT therefore opens a resilient SSH tunnel to the
+inverter's localhost port 80. It does not install a proxy, alter the inverter's
+firewall, or persist anything on the inverter beyond the authorized root SSH
+key described in [the installer guide](extras/INSTALLER.md).
 
-Also, this is 100% local, no cloud involved.
+## Docker quick start
 
-## Usage
+The SSH private key is required. Keep it outside the repository, set its mode to
+`0600`, and mount it read-only:
 
-It's really simple, it requires the hostname of your pika inverter. Once this has been done, you "simply" run `pika2mqtt.py` with the following parameters:
+```sh
+chmod 600 /secure/path/pika-rsa
 
-### With the public profile information
-
-No longer supported
-
-### With the Pika inverter in installer mode
-
-- Hostname or IP of your inverter, simply the IP/DNS name of it (for example, `my-inverter.domain.net` or `192.168.1.42`)
-- MQTT broker (for example, `mqtt.local`)
-- A base for all topics to be published, I use `house/energy`
-- Zero or more serials (all uppercase) which should be ignored
-- Using `--idrsa` you can get the service to install/restart the SSH hack, see [INSTALLER.md](extras/INSTALLER.md)
-
-> For details on how to run installer mode, see [INSTALLER.md](extras/INSTALLER.md) in the `extras/` directory
-
-Once started, the tool and begin polling the JSON endpoints every minute (that's as often as they refresh the data on their website, so don't bother hitting it harder).
-
-As it runs, it will print out whenever it changes the values. It will not post duplicate values.
-
-For all power generating/charging units, it will produce a topic ending with `output` for when it's producing power and `input` for when consuming. Typically only the battery will consume power (well, the inverter sometimes does it too if the sun is down and your system is grid tied).
-
-All devices publish a `state` which is the raw state of the unit (see source for how to map that if you're interested). A bettery will also publish a `charge` topic, which indicates the charge of your battery. It's going to be a multiple of 10 since I want to avoid floats but still keep 1 fraction's precision (same as pika). So 945 is 94.5%
-
-The topic also contains the device type and the serial number, so a solar panel with the id `00010003BEEF` will publish the following topics:
-
+docker run -d \
+  --name pika2mqtt \
+  --restart unless-stopped \
+  -e HOSTNAME=192.168.1.42 \
+  -e MQTT=mqtt.local \
+  -e BASETOPIC=house/energy \
+  -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
+  -v /secure/path/pika-rsa:/key/id_rsa:ro \
+  mrworf/pika2mqtt:latest
 ```
+
+Obtain the inverter's ED25519 host-key fingerprint from a trusted LAN before
+starting the container:
+
+```sh
+ssh-keyscan -t ed25519 192.168.1.42 2>/dev/null \
+  | ssh-keygen -lf - -E sha256
+```
+
+Confirm the fingerprint through a trusted connection or console. The container
+will refuse a different host identity rather than disabling SSH verification.
+
+MQTT authentication remains optional:
+
+```sh
+-e MQTT_USER=pika2mqtt -e MQTT_PASSWORD='mqtt-password'
+```
+
+Follow tunnel state and reconnect attempts through normal container logs:
+
+```sh
+docker logs -f pika2mqtt
+```
+
+The supervisor detects SSH exits and unusable tunnels, uses SSH keepalives,
+retries with jittered exponential backoff capped at 60 seconds, and resumes
+polling automatically after an inverter reboot or network outage.
+
+## Optional installer website
+
+The web gateway is disabled by default. To expose authenticated, read-only
+access on the Docker host's port 8000, create a password secret and explicitly
+publish the port:
+
+```sh
+printf '%s\n' 'choose-a-strong-password' >/secure/path/pika-web-password
+chmod 600 /secure/path/pika-web-password
+
+docker run -d \
+  --name pika2mqtt \
+  --restart unless-stopped \
+  -e HOSTNAME=192.168.1.42 \
+  -e MQTT=mqtt.local \
+  -e BASETOPIC=house/energy \
+  -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
+  -e WEB_ENABLED=true \
+  -e WEB_USERNAME=operator \
+  -e WEB_PASSWORD_FILE=/run/secrets/pika-web-password \
+  -v /secure/path/pika-rsa:/key/id_rsa:ro \
+  -v /secure/path/pika-web-password:/run/secrets/pika-web-password:ro \
+  -p 8000:8000 \
+  mrworf/pika2mqtt:latest
+```
+
+Open `http://<docker-host>:8000/` and enter the configured Basic Auth
+credentials. Read-only mode permits GET, HEAD, and OPTIONS, which is sufficient
+to load the installer interface and inspect values. Other methods return 405.
+
+To allow installer POST and other write methods, add:
+
+```sh
+-e WEB_WRITE_ENABLED=true
+```
+
+Write mode can change safety- and operation-relevant inverter configuration.
+Enable it only when needed. Basic Auth does not encrypt traffic, so publish this
+port only on a trusted LAN or place a TLS reverse proxy in front of it.
+
+`WEB_PASSWORD` may be used instead of `WEB_PASSWORD_FILE`, but a mounted secret
+file is preferred. The file takes precedence if both are set.
+
+## Configuration
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `HOSTNAME` | required | Inverter IP address or DNS name |
+| `MQTT` | required | MQTT broker hostname |
+| `MQTT_USER` / `MQTT_PASSWORD` | empty | Optional MQTT credentials |
+| `BASETOPIC` | required | MQTT topic prefix |
+| `IDRSA` | `/key/id_rsa` | Mounted inverter root private key |
+| `SSH_HOST_FINGERPRINT` | required | Expected ED25519 SHA-256 fingerprint |
+| `SSH_PORT` | `22` | Inverter SSH port |
+| `SSH_LOCAL_PORT` | `18080` | Internal loopback tunnel port |
+| `WEB_ENABLED` | `false` | Start the authenticated web gateway |
+| `WEB_WRITE_ENABLED` | `false` | Forward methods other than GET/HEAD/OPTIONS |
+| `WEB_LISTEN` | `0.0.0.0` | Gateway address inside the container |
+| `WEB_PORT` | `8000` | Gateway port inside the container |
+| `WEB_USERNAME` | required for web | Gateway Basic Auth username |
+| `WEB_PASSWORD_FILE` | empty | Preferred gateway password secret file |
+| `WEB_PASSWORD` | empty | Gateway password fallback |
+| `IGNORE` | empty | Space-separated uppercase device serials to ignore |
+| `DEBUG` | empty | Set to `--debug` for verbose logs |
+
+The same behavior is available outside Docker through `pika2mqtt.py --help`.
+Passwords intentionally have no web-gateway command-line option so they do not
+appear in process arguments.
+
+## MQTT topics
+
+Devices publish below `<base>/<type>_<serial>/`. Power-producing values use
+`output`; consuming values use `input`. Raw signed power and interval energy
+values are also published by the current collector.
+
+Examples:
+
+```text
 house/energy/solar_00010003BEEF/output
-```
-
-And a battery will look like this
-
-```
 house/energy/battery_00010003BEEF/input
 house/energy/battery_00010003BEEF/output
 house/energy/battery_00010003BEEF/charge
-```
-
-There's also a couple of extra topics. The next one is simply an additon of all solar panel output
-
-```
-house/energy/total_solar/output
-```
-
-You also get grid and house
-```
-house/energy/grid/output
+house/energy/solar_total/output
 house/energy/grid/input
-house/energy/house/input
+house/energy/grid/output
+house/energy/connected/state
 ```
 
-This uses the Current transformers (CT) which are clamped around the feed to your main panel and will show how much you consume from the grid (output) or sell to the grid (input). Likewise, house topic implies how much power your household is consuming.
+Battery charge is multiplied by ten to avoid a floating-point MQTT payload, so
+`945` represents 94.5%. Grid readings depend on correctly installed current
+transformers.
 
-> ***NOTE***
-> These three topics will *only* work properly if you have CT installed properly (some installers will sometimes install them on the feed between the main panel and the inverter, which obviously will be a bit misleading).
+The MQTT data can be consumed directly by Home Assistant or stored through
+tools such as Telegraf and InfluxDB for visualization in Grafana.
 
-Now, when you combine this tool with [telegraf](https://www.influxdata.com/time-series-platform/telegraf/ "telegraf"), [influxDB](https://www.influxdata.com/products/influxdb-overview/ "influxDB") and [grafana](https://grafana.com/ "grafana"), you get nice looking items such as
+## Troubleshooting
 
-![grafana scrennshot](images/grafana.png "Grafana screenshot")
+- `SSH host-key mismatch`: stop and verify whether the inverter host key
+  legitimately changed after service or firmware replacement. Update the
+  configured fingerprint only after independent verification.
+- `SSH tunnel connection failed`: confirm port 22 reachability, the root public
+  key installation, private-key permissions, and the configured address.
+- Repeated reconnect logs: the delay will increase to at most 60 seconds; the
+  container should remain running and recover automatically.
+- Web gateway returns 503: the SSH tunnel is currently disconnected.
+- Web gateway returns 502: the tunnel exists but the installer server did not
+  complete that request.
+- Web gateway returns 405: write methods are disabled; enable
+  `WEB_WRITE_ENABLED` only if the operation is intended.
 
-## Docker image
-
-To simplify things, you can also run this as a docker image. The arguments above are provided via environment variables HOSTNAME, MQTT and BASETOPIC. You need to run it with a terminal (ie, `-t`) or it will not work.
-
-Also, if you mount `id_rsa` file into `/key/id_rsa` then it will be able to monitor the service on the inverter and restart it if needed.
-
-The project is published on https://hub.docker.com/r/mrworf/pika2mqtt
+The historical port-8000 Python proxy and firewall workaround are no longer
+used or supported.

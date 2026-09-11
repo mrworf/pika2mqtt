@@ -29,9 +29,9 @@ The root SSH key remains the inverter's only persistent modification.
 
 ## Delivery slices
 
-1. [Slice 01: resilient SSH transport](20260911055337_resilient_ssh_web_gateway_slice_01.md)
-2. [Slice 02: authenticated installer web gateway](20260911055337_resilient_ssh_web_gateway_slice_02.md)
-3. [Slice 03: container packaging and operator documentation](20260911055337_resilient_ssh_web_gateway_slice_03.md)
+1. [Slice 01: resilient SSH transport](20260911055337_resilient_ssh_web_gateway_slice_01.md) — complete in `3461da7`
+2. [Slice 02: authenticated installer web gateway](20260911055337_resilient_ssh_web_gateway_slice_02.md) — complete in `03eae47`
+3. [Slice 03: container packaging and operator documentation](20260911055337_resilient_ssh_web_gateway_slice_03.md) — complete in the `Package resilient SSH gateway` commit
 
 ## Acceptance
 

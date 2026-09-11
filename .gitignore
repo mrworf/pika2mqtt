@@ -1,2 +1,4 @@
 run.sh
 
+# Local production credential; never commit this file.
+/pika-rsa

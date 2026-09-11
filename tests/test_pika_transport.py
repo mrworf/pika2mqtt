@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -157,6 +158,58 @@ class TunnelConfigurationTests(unittest.TestCase):
         self.assertEqual(process.terminate_calls, 1)
         self.assertIn("SSH tunnel established", "\n".join(logs.output))
         self.assertEqual(tunnel.state, "stopping")
+
+    @mock.patch("pika_transport.SshTunnelSupervisor._backoff_delay", return_value=0.01)
+    @mock.patch("pika_transport.socket.create_connection")
+    @mock.patch("pika_transport.subprocess.Popen")
+    @mock.patch("pika_transport.HostKeyVerifier.verify", return_value="/tmp/known_hosts")
+    @mock.patch("pika_transport.SshTunnelConfig.validate")
+    def test_supervisor_logs_loss_and_reestablishes_tunnel(
+        self, _validate, _verify, popen, create_connection, _backoff
+    ):
+        class FakeProcess:
+            def __init__(self, exit_after_ready=False):
+                self.returncode = None
+                self.stderr = []
+                self.polls = 0
+                self.exit_after_ready = exit_after_ready
+
+            def poll(self):
+                self.polls += 1
+                if self.exit_after_ready and self.polls >= 2:
+                    self.returncode = 255
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        first = FakeProcess(exit_after_ready=True)
+        second = FakeProcess()
+        popen.side_effect = [first, second]
+        create_connection.return_value = mock.MagicMock()
+        tunnel = SshTunnelSupervisor(
+            SshTunnelConfig("host", "/key", EXPECTED_FINGERPRINT)
+        )
+
+        with self.assertLogs("pika_transport", level="INFO") as logs:
+            tunnel.start()
+            deadline = time.monotonic() + 2
+            while popen.call_count < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(popen.call_count, 2)
+            self.assertTrue(tunnel.wait_available(1))
+            tunnel.stop()
+
+        output = "\n".join(logs.output)
+        self.assertIn("SSH tunnel lost", output)
+        self.assertIn("SSH tunnel reconnect scheduled", output)
+        self.assertGreaterEqual(output.count("SSH tunnel established"), 2)
 
 
 class CollectorTransportTests(unittest.TestCase):
