@@ -134,6 +134,9 @@ class TelemetryTests(unittest.TestCase):
             snapshot = collector.poll()
             self.assertEqual(snapshot["pv_links"], {})
             self.assertEqual(snapshot["untracked_pv_links"], ["000100030001"])
+            self.assertEqual(snapshot["system"]["untracked_pv_link_count"], 1)
+            self.assertEqual(snapshot["system"]["untracked_pv_links"], ["000100030001"])
+            self.assertEqual(snapshot["system"]["solar_power_w"], 312)
 
     def test_absent_or_stale_learned_string_is_disconnected_at_boundary(self):
         with tempfile.TemporaryDirectory() as directory:

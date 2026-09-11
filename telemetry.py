@@ -475,8 +475,15 @@ class InstallerTelemetry:
         connected = sum(1 for state in pvs.values() if state["connected"])
         faulted = sum(1 for state in pvs.values() if state["fault"])
         unknown_faults = sum(1 for state in pvs.values() if state["fault"] is None)
+        visible_pv_serials = {
+            serial
+            for serial, item in self._last_devices.items()
+            if item["kind"] == "pv" and serial not in self.ignored
+        }
+        untracked = sorted(visible_pv_serials.difference(self.inventory.serials))
         solar_power = sum(
-            state["output_power_w"] or 0 for state in pvs.values() if state["present"]
+            max(0, _number(self._last_devices[serial], "power") or 0)
+            for serial in visible_pv_serials
         )
         return {
             "timestamp": int(now),
@@ -490,14 +497,12 @@ class InstallerTelemetry:
                 "unknown_fault_string_count": unknown_faults,
                 "any_string_disconnected": connected != len(pvs),
                 "any_string_faulted": faulted > 0,
+                "untracked_pv_link_count": len(untracked),
+                "untracked_pv_links": untracked,
             },
             "inverter": inverter,
             "grid": grid,
             "batteries": batteries,
             "pv_links": pvs,
-            "untracked_pv_links": sorted(
-                serial
-                for serial, item in self._last_devices.items()
-                if item["kind"] == "pv" and serial not in self.inventory.serials
-            ),
+            "untracked_pv_links": untracked,
         }

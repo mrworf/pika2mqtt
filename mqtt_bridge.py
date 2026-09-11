@@ -45,6 +45,7 @@ class MqttBridge:
         )
         self.client.reconnect_delay_set(min_delay=1, max_delay=60)
         self.client.on_connect = self.on_connect
+        self.client.on_connect_fail = self.on_connect_fail
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
 
@@ -77,6 +78,10 @@ class MqttBridge:
             LOG.warning("MQTT broker disconnected unexpectedly (%s); reconnecting", reason_code)
         else:
             LOG.info("MQTT broker disconnected")
+
+    def on_connect_fail(self, client, userdata):
+        self.connected.clear()
+        LOG.warning("MQTT connection attempt failed; automatic retry remains active")
 
     def on_message(self, client, userdata, message):
         if message.topic != f"{self.discovery_prefix}/status":
@@ -247,6 +252,7 @@ class MqttBridge:
             "disconnected_strings": self._sensor(root, "disconnected_string_count", "Disconnected strings", system_topic, availability=service_availability, entity_category="diagnostic"),
             "faulted_strings": self._sensor(root, "faulted_string_count", "Faulted strings", system_topic, availability=service_availability, entity_category="diagnostic"),
             "unknown_fault_strings": self._sensor(root, "unknown_fault_string_count", "Strings with unknown fault state", system_topic, availability=service_availability, entity_category="diagnostic"),
+            "untracked_strings": self._sensor(root, "untracked_pv_link_count", "Untracked PV Links", system_topic, availability=service_availability, entity_category="diagnostic"),
             "any_string_disconnected": self._binary(root, "any_string_disconnected", "String disconnected", system_topic, availability=service_availability, device_class="problem"),
             "any_string_faulted": self._binary(root, "any_string_faulted", "String fault", system_topic, availability=service_availability, device_class="problem"),
             "inverter_power": self._sensor(root, "power_w", "Inverter power", inverter_topic, availability=parent_availability, object_key="inverter_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
