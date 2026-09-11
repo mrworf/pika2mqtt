@@ -56,6 +56,127 @@ The supervisor detects SSH exits and unusable tunnels, uses SSH keepalives,
 retries with jittered exponential backoff capped at 60 seconds, and resumes
 polling automatically after an inverter reboot or network outage.
 
+## Migrating an existing Docker installation
+
+Releases using the resilient SSH tunnel are not drop-in replacements for the
+older port-8000 proxy image. MQTT topics and the `HOSTNAME`, `MQTT`,
+`MQTT_USER`, `MQTT_PASSWORD`, `BASETOPIC`, `IGNORE`, and `/key/id_rsa`
+interfaces remain compatible, so Home Assistant does not need to be
+reconfigured. The transport requirements have changed:
+
+- The SSH private key is now mandatory and should be mounted read-only.
+- `SSH_HOST_FINGERPRINT` is mandatory.
+- The Docker host must reach the inverter on TCP/22.
+- The container no longer connects to or maintains port 8000 on the inverter.
+- `-t` is no longer required when starting the container.
+
+Before updating, retain the old container or its Compose configuration so it
+can be restored. Stop the old container before starting the new version; an old
+instance left running may continue reinstalling the obsolete Pi-side proxy.
+Compose users should also give the currently running image an immutable local
+rollback tag before pulling `latest`:
+
+```sh
+docker image tag "$(docker inspect --format '{{.Image}}' pika2mqtt)" \
+  pika2mqtt:pre-ssh-tunnel
+```
+
+Obtain and independently verify the fingerprint as shown above, make sure the
+existing private key has mode `0600`, and then migrate using the appropriate
+deployment style.
+
+### Existing `docker run` deployment
+
+Pull the new image, preserve the stopped old container for rollback, and create
+the replacement with the additional fingerprint setting:
+
+```sh
+docker pull mrworf/pika2mqtt:latest
+docker stop pika2mqtt
+docker rename pika2mqtt pika2mqtt-pre-ssh-tunnel
+
+docker run -d \
+  --name pika2mqtt \
+  --restart unless-stopped \
+  -e HOSTNAME=192.168.1.42 \
+  -e MQTT=mqtt.local \
+  -e BASETOPIC=house/energy \
+  -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
+  -v /secure/path/pika-rsa:/key/id_rsa:ro \
+  mrworf/pika2mqtt:latest
+```
+
+Carry over any existing MQTT credentials, `IGNORE`, `DEBUG`, custom `IDRSA`, or
+other settings from the old container. Do not copy the example addresses or
+credentials literally.
+
+### Existing Docker Compose deployment
+
+Update the service to include the fingerprint and a read-only key mount. A
+minimal complete service is:
+
+```yaml
+services:
+  pika2mqtt:
+    image: mrworf/pika2mqtt:latest
+    container_name: pika2mqtt
+    restart: unless-stopped
+    environment:
+      HOSTNAME: 192.168.1.42
+      MQTT: mqtt.local
+      BASETOPIC: house/energy
+      SSH_HOST_FINGERPRINT: "SHA256:replace-with-your-fingerprint"
+    volumes:
+      - /secure/path/pika-rsa:/key/id_rsa:ro
+```
+
+Keep any existing MQTT credentials and other optional environment values, then
+recreate the service:
+
+```sh
+docker compose pull pika2mqtt
+docker compose up -d --force-recreate pika2mqtt
+```
+
+### Verify and roll back
+
+Follow startup and recovery state in the container logs:
+
+```sh
+docker logs -f pika2mqtt
+```
+
+A successful migration logs `Connecting SSH tunnel`, followed by
+`SSH tunnel established` and `Starting the monitor`. Confirm that Home
+Assistant begins receiving its existing MQTT topics. Fingerprint mismatches are
+fatal; network, SSH, and inverter reboot failures remain logged and retry with
+bounded backoff.
+
+No inverter cleanup is required. The old proxy process and firewall rule are
+ignored by the new container and normally disappear on an inverter reboot. A
+stale proxy file is harmless. Keep the authorized root key because the SSH
+tunnel requires it.
+
+If another tool or bookmark previously used `http://<inverter>:8000`, that
+endpoint is no longer maintained. Enable the web gateway described below,
+publish its port explicitly, and use `http://<docker-host>:8000` instead. The
+gateway requires Basic Auth and remains read-only unless
+`WEB_WRITE_ENABLED=true` is set.
+
+To roll back a `docker run` deployment, stop and remove only the replacement,
+restore the preserved container name, and restart it:
+
+```sh
+docker stop pika2mqtt
+docker rm pika2mqtt
+docker rename pika2mqtt-pre-ssh-tunnel pika2mqtt
+docker start pika2mqtt
+```
+
+For Compose, restore the saved Compose file, set the service image to
+`pika2mqtt:pre-ssh-tunnel`, and recreate the service. Rollback does not require
+changing the inverter or removing its authorized key.
+
 ## Optional installer website
 
 The web gateway is disabled by default. To expose authenticated, read-only
