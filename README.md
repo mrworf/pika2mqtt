@@ -17,10 +17,12 @@ key described in [the installer guide](extras/INSTALLER.md).
 ## Docker quick start
 
 The SSH private key is required. Keep it outside the repository, set its mode to
-`0600`, and mount it read-only:
+`0600`, and mount it read-only. Create a separate directory for the learned PV
+Link inventory:
 
 ```sh
 chmod 600 /secure/path/pika-rsa
+mkdir -p /secure/path/pika2mqtt-data
 
 docker run -d \
   --name pika2mqtt \
@@ -30,6 +32,7 @@ docker run -d \
   -e BASETOPIC=house/energy \
   -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
+  -v /secure/path/pika2mqtt-data:/data \
   ghcr.io/mrworf/pika2mqtt:latest
 ```
 
@@ -67,16 +70,27 @@ as `v1.2.3` publishes the corresponding container tag as well.
 
 ## Migrating an existing Docker installation
 
-Releases using the resilient SSH tunnel are not drop-in replacements for the
-older port-8000 proxy image. MQTT topics and the `HOSTNAME`, `MQTT`,
-`MQTT_USER`, `MQTT_PASSWORD`, `BASETOPIC`, `IGNORE`, and `/key/id_rsa`
-interfaces remain compatible, so Home Assistant does not need to be
-reconfigured. The transport requirements have changed:
+This release is not a drop-in replacement for either the older port-8000 proxy
+image or the previous MQTT publisher. Home Assistant discovery is now enabled
+by default and replaces the legacy per-value topic tree with retained JSON
+state. Existing dashboards and automations that directly reference topics such
+as `<base>/solar_total/output`, `<base>/battery_<serial>/charge`, or
+`<base>/connected/state` must be moved to the discovered entities or the new
+topics documented below. The old topics stop updating immediately after the
+upgrade. In particular, battery percentage is now a real percentage rather
+than a value multiplied by ten, and the incorrect interval `*_kwh` topics have
+been removed.
+
+The `HOSTNAME`, `MQTT`, `MQTT_USER`, `MQTT_PASSWORD`, `BASETOPIC`, `IGNORE`,
+and `/key/id_rsa` interfaces remain available. Transport and persistent-state
+requirements are:
 
 - The SSH private key is now mandatory and should be mounted read-only.
 - `SSH_HOST_FINGERPRINT` is mandatory.
 - The Docker host must reach the inverter on TCP/22.
 - The container no longer connects to or maintains port 8000 on the inverter.
+- Mount a writable directory at `/data`; this stores only learned PV Link
+  identities. Keep it separate from the read-only SSH key mount.
 - `-t` is no longer required when starting the container.
 - Published images now use `ghcr.io/mrworf/pika2mqtt`; replace the previous
   `mrworf/pika2mqtt` Docker Hub image name in Docker or Compose configurations.
@@ -114,6 +128,7 @@ docker run -d \
   -e BASETOPIC=house/energy \
   -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
+  -v /secure/path/pika2mqtt-data:/data \
   ghcr.io/mrworf/pika2mqtt:latest
 ```
 
@@ -139,6 +154,7 @@ services:
       SSH_HOST_FINGERPRINT: "SHA256:replace-with-your-fingerprint"
     volumes:
       - /secure/path/pika-rsa:/key/id_rsa:ro
+      - /secure/path/pika2mqtt-data:/data
 ```
 
 Keep any existing MQTT credentials and other optional environment values, then
@@ -158,10 +174,23 @@ docker logs -f pika2mqtt
 ```
 
 A successful migration logs `Connecting SSH tunnel`, followed by
-`SSH tunnel established` and `Starting the monitor`. Confirm that Home
-Assistant begins receiving its existing MQTT topics. Fingerprint mismatches are
-fatal; network, SSH, and inverter reboot failures remain logged and retry with
+`SSH tunnel established`, `MQTT broker connected`, and `Starting the telemetry
+monitor`. Confirm that Home Assistant creates the PWRcell device and its PV Link
+children. Fingerprint mismatches and corrupt inventory files are fatal;
+network, SSH, MQTT, and inverter reboot failures remain logged and recover with
 bounded backoff.
+
+Initially leave `PV_INVENTORY_FREEZE=false`. After all expected PV Links have
+appeared in Home Assistant and the inventory log (six on the system used during
+development), restart with `PV_INVENTORY_FREEZE=true`. Learning is additive and
+has no built-in limit, so future arrays with a different number of strings work
+without code changes. With learning frozen, a new unrecognized string is
+reported in the system state but is not added as a monitored child.
+
+To intentionally relearn the array, stop the container, delete only the file
+configured by `PV_INVENTORY_FILE`, start with learning unfrozen, verify the
+expected strings, then freeze again. Never delete, move, or change permissions
+on `/key/id_rsa` as part of this process.
 
 No inverter cleanup is required. The old proxy process and firewall rule are
 ignored by the new container and normally disappear on an inverter reboot. A
@@ -209,6 +238,7 @@ docker run -d \
   -e WEB_USERNAME=operator \
   -e WEB_PASSWORD_FILE=/run/secrets/pika-web-password \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
+  -v /secure/path/pika2mqtt-data:/data \
   -v /secure/path/pika-web-password:/run/secrets/pika-web-password:ro \
   -p 8000:8000 \
   ghcr.io/mrworf/pika2mqtt:latest
@@ -238,11 +268,20 @@ file is preferred. The file takes precedence if both are set.
 | `HOSTNAME` | required | Inverter IP address or DNS name |
 | `MQTT` | required | MQTT broker hostname |
 | `MQTT_USER` / `MQTT_PASSWORD` | empty | Optional MQTT credentials |
+| `MQTT_PORT` | `1883` | MQTT broker port |
+| `MQTT_CLIENT_ID` | derived from `HOSTNAME` | Stable broker client identifier |
 | `BASETOPIC` | required | MQTT topic prefix |
 | `IDRSA` | `/key/id_rsa` | Mounted inverter root private key |
 | `SSH_HOST_FINGERPRINT` | required | Expected ED25519 SHA-256 fingerprint |
 | `SSH_PORT` | `22` | Inverter SSH port |
 | `SSH_LOCAL_PORT` | `18080` | Internal loopback tunnel port |
+| `REFRESH` | `15` | `/devices` polling interval in seconds |
+| `DETAIL_REFRESH` | `60` | Successful model polling interval in seconds |
+| `DISCONNECT_AFTER` | `120` | Seconds before API/PV Link data is disconnected |
+| `PV_INVENTORY_FILE` | `/data/pv_inventory.json` | Versioned learned PV Link inventory |
+| `PV_INVENTORY_FREEZE` | `false` | Prevent newly observed PV Links from being learned |
+| `HA_DISCOVERY_ENABLED` | `true` | Publish Home Assistant MQTT device discovery |
+| `HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant discovery prefix |
 | `WEB_ENABLED` | `false` | Start the authenticated web gateway |
 | `WEB_WRITE_ENABLED` | `false` | Forward methods other than GET/HEAD/OPTIONS |
 | `WEB_LISTEN` | `0.0.0.0` | Gateway address inside the container |
@@ -257,31 +296,65 @@ The same behavior is available outside Docker through `pika2mqtt.py --help`.
 Passwords intentionally have no web-gateway command-line option so they do not
 appear in process arguments.
 
-## MQTT topics
+## MQTT and Home Assistant
 
-Devices publish below `<base>/<type>_<serial>/`. Power-producing values use
-`output`; consuming values use `input`. Raw signed power and interval energy
-values are also published by the current collector.
+All state, availability, and discovery messages use QoS 1 and retained
+payloads. The broker last will and graceful shutdown payload are both
+`disconnected`; a successful MQTT session publishes `connected`. The publisher
+automatically reconnects with bounded backoff and republishes state and
+discovery after reconnect or a `homeassistant/status` birth message.
 
-Examples:
+State is normalized JSON under:
 
 ```text
-house/energy/solar_00010003BEEF/output
-house/energy/battery_00010003BEEF/input
-house/energy/battery_00010003BEEF/output
-house/energy/battery_00010003BEEF/charge
-house/energy/solar_total/output
-house/energy/grid/input
-house/energy/grid/output
-house/energy/connected/state
+house/energy/state/system
+house/energy/state/inverter
+house/energy/state/grid
+house/energy/state/battery/000100080701
+house/energy/state/pv/00010003119C
 ```
 
-Battery charge is multiplied by ten to avoid a floating-point MQTT payload, so
-`945` represents 94.5%. Grid readings depend on correctly installed current
-transformers.
+Availability uses:
 
-The MQTT data can be consumed directly by Home Assistant or stored through
-tools such as Telegraf and InfluxDB for visualization in Grafana.
+```text
+house/energy/availability/service
+house/energy/availability/inverter
+house/energy/availability/pv/00010003119C
+```
+
+Home Assistant discovery creates one PWRcell inverter/system device, a battery
+child, and one child per learned PV Link. Principal power, battery, energy,
+status, connectivity, SnapRS, and PVRSS measurements are exposed directly.
+Every scalar supplied by the detailed installer models is also available as a
+disabled-by-default diagnostic entity.
+
+Power uses watts, battery charge uses percent, and energy uses kWh. Positive
+grid power means export and positive battery power means discharge; separate
+nonnegative import/export and charge/discharge sensors are also provided. Grid
+import/export energy comes from the inverter's native `REbus_exp` `Whin` and
+`Whx` counters. Other device energy counters are labeled accumulated energy
+rather than being misrepresented as solar production.
+
+Each PV Link has independent connectivity and fault signals. Connectivity is
+based on `/devices` presence and `lastheard`; a string becomes disconnected
+after 120 seconds by default. A detailed model returning HTTP 400/500 does not
+by itself disconnect a string. Faults cover REbus error states, PV Link error
+bits, PVRSS lockout, and failed PVRSS self-tests. `LOW_SUN`, disabled, and
+transitional states remain visible status values but do not count as a
+disconnect. If the firmware does not serve the detail models, fault status is
+unknown rather than incorrectly clear; connection and power monitoring still
+continue from `/devices`. The system device provides separate aggregate “any
+string disconnected” and “any string faulted” binary sensors for alerting.
+
+The collector follows the endpoint contract used by the installer UI:
+`/devices`; inverter `common`, `REbus_status`, `inverter_status`, `REbus_exp`,
+and `inverter`; battery `common`, `REbus_status`, and `battery`; and PV Link
+`common`, `REbus_status`, `pvlink_status`, and `pvrss_telemetry`. Detailed model
+errors are logged and retried with per-route exponential backoff capped at 15
+minutes while `/devices` polling continues.
+
+Set `HA_DISCOVERY_ENABLED=false` to consume the JSON topics without Home
+Assistant discovery, for example through Telegraf or InfluxDB.
 
 ## Troubleshooting
 

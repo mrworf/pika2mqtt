@@ -103,9 +103,37 @@ class TelemetryTests(unittest.TestCase):
             snapshot = collector.poll()
             pv = snapshot["pv_links"]["000100030001"]
             self.assertTrue(pv["connected"])
-            self.assertFalse(pv["fault"])
+            self.assertIsNone(pv["fault"])
+            self.assertEqual(pv["fault_summary"], "unknown")
             self.assertFalse(pv["endpoint_health"]["pvlink_status"]["available"])
             self.assertEqual(pv["endpoint_health"]["pvlink_status"]["retry_in_seconds"], 60)
+
+    def test_model_failure_backoff_grows_and_is_capped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1000]
+            routes = {"/devices": self.fixture("devices.json")}
+            collector = self.collector(directory, routes, detail_interval=60)
+            collector.clock = lambda: now[0]
+            key = ("000100030001", "pvlink_status")
+            expected_delays = [60, 120, 240, 480, 900]
+            for delay in expected_delays:
+                collector.poll()
+                self.assertEqual(collector._endpoint_health[key]["retry_in_seconds"], delay)
+                now[0] = collector._next_detail[key]
+
+    def test_frozen_collector_reports_but_does_not_monitor_unknown_pv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = PvInventory(str(Path(directory, "inventory.json")), frozen=True)
+            collector = InstallerTelemetry(
+                "http://installer",
+                inventory,
+                clock=lambda: 1000,
+                request_get=lambda url, timeout: Response(self.fixture("devices.json"))
+                if url.endswith("/devices") else Response(status=500),
+            )
+            snapshot = collector.poll()
+            self.assertEqual(snapshot["pv_links"], {})
+            self.assertEqual(snapshot["untracked_pv_links"], ["000100030001"])
 
     def test_absent_or_stale_learned_string_is_disconnected_at_boundary(self):
         with tempfile.TemporaryDirectory() as directory:

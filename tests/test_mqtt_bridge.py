@@ -41,7 +41,7 @@ class FakeClient:
 def snapshot():
     return {
         "api_connected": True,
-        "system": {"solar_power_w": 1200, "learned_string_count": 1, "connected_string_count": 1, "disconnected_string_count": 0, "faulted_string_count": 0, "any_string_disconnected": False, "any_string_faulted": False},
+        "system": {"solar_power_w": 1200, "learned_string_count": 1, "connected_string_count": 1, "disconnected_string_count": 0, "faulted_string_count": 0, "unknown_fault_string_count": 0, "any_string_disconnected": False, "any_string_faulted": False},
         "inverter": {"serial": "0001000706FA", "power_w": 1000, "accumulated_energy_kwh": 42, "status": "making_power"},
         "grid": {"power_w": 500, "import_power_w": 0, "export_power_w": 500, "import_energy_kwh": 2, "export_energy_kwh": 41},
         "batteries": [{"serial": "000100080701", "power_w": -100, "input_power_w": 100, "output_power_w": 0, "state_of_charge_percent": 90.5, "status": "charging_battery"}],

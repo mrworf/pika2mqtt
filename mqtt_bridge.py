@@ -246,6 +246,7 @@ class MqttBridge:
             "connected_strings": self._sensor(root, "connected_string_count", "Connected strings", system_topic, availability=service_availability, entity_category="diagnostic"),
             "disconnected_strings": self._sensor(root, "disconnected_string_count", "Disconnected strings", system_topic, availability=service_availability, entity_category="diagnostic"),
             "faulted_strings": self._sensor(root, "faulted_string_count", "Faulted strings", system_topic, availability=service_availability, entity_category="diagnostic"),
+            "unknown_fault_strings": self._sensor(root, "unknown_fault_string_count", "Strings with unknown fault state", system_topic, availability=service_availability, entity_category="diagnostic"),
             "any_string_disconnected": self._binary(root, "any_string_disconnected", "String disconnected", system_topic, availability=service_availability, device_class="problem"),
             "any_string_faulted": self._binary(root, "any_string_faulted", "String fault", system_topic, availability=service_availability, device_class="problem"),
             "inverter_power": self._sensor(root, "power_w", "Inverter power", inverter_topic, availability=parent_availability, object_key="inverter_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
@@ -299,7 +300,7 @@ class MqttBridge:
         measurement_availability = self._availability(pv_serial=serial)
         components = {
             "disconnected": self._component("binary_sensor", f"{child}_disconnected", "Disconnected", topic, "{{ 'OFF' if value_json.connected else 'ON' }}", connected_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
-            "fault": self._binary(child, "fault", "Fault", topic, availability=measurement_availability, device_class="problem"),
+            "fault": self._component("binary_sensor", f"{child}_fault", "Fault", topic, "{{ 'ON' if value_json.fault == true else ('OFF' if value_json.fault == false else 'UNKNOWN') }}", measurement_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
             "fault_summary": self._sensor(child, "fault_summary", "Fault summary", topic, availability=measurement_availability, entity_category="diagnostic"),
             "power": self._sensor(child, "power_w", "Power", topic, availability=measurement_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
             "input_voltage": self._sensor(child, "input_voltage_v", "Input voltage", topic, availability=measurement_availability, device_class="voltage", unit_of_measurement="V", state_class="measurement"),

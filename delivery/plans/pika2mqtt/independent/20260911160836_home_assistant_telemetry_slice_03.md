@@ -15,6 +15,8 @@ behavior, and safely migrate from the removed legacy topics.
 - Rewrite the MQTT documentation for JSON state, availability, device
   discovery, measurements, fault semantics, commissioning, freezing, reset,
   and the breaking removal of legacy topics and scaled battery values.
+- Preserve an unknown fault state when live firmware returns HTTP 500 for PV
+  detail models; never convert missing diagnostics into a false clear state.
 - Extend the existing migration section with dashboard/automation impact and a
   Compose example that mounts a dedicated data path.
 

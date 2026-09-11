@@ -406,9 +406,16 @@ class InstallerTelemetry:
             fault_reasons.append(f"pvrss_{state['pvrss_self_test']}")
         if pvrss.get("LockoutError"):
             fault_reasons.append("pvrss_lockout")
+        assessment_models = {"REbus_status", "pvlink_status", "pvrss_telemetry"}
+        assessment_complete = assessment_models.issubset(state.get("raw_models", {}))
         state["fault_reasons"] = sorted(set(fault_reasons))
-        state["fault_summary"] = ", ".join(state["fault_reasons"]) or "none"
-        state["fault"] = bool(state["fault_reasons"])
+        state["fault_assessment_complete"] = assessment_complete
+        state["fault"] = True if state["fault_reasons"] else (False if assessment_complete else None)
+        state["fault_summary"] = (
+            ", ".join(state["fault_reasons"])
+            if state["fault_reasons"]
+            else ("none" if assessment_complete else "unknown")
+        )
         return state
 
     def _generic_state(self, serial: str, kind: str, now: float) -> dict[str, Any]:
@@ -467,6 +474,7 @@ class InstallerTelemetry:
             }
         connected = sum(1 for state in pvs.values() if state["connected"])
         faulted = sum(1 for state in pvs.values() if state["fault"])
+        unknown_faults = sum(1 for state in pvs.values() if state["fault"] is None)
         solar_power = sum(
             state["output_power_w"] or 0 for state in pvs.values() if state["present"]
         )
@@ -479,6 +487,7 @@ class InstallerTelemetry:
                 "connected_string_count": connected,
                 "disconnected_string_count": len(pvs) - connected,
                 "faulted_string_count": faulted,
+                "unknown_fault_string_count": unknown_faults,
                 "any_string_disconnected": connected != len(pvs),
                 "any_string_faulted": faulted > 0,
             },
