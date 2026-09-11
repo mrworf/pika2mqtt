@@ -26,7 +26,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir requests paho-mqtt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 EXPOSE 8000
 

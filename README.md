@@ -1,5 +1,9 @@
 # Pika to MQTT
 
+[![CI](https://github.com/mrworf/pika2mqtt/actions/workflows/docker-image.yml/badge.svg?branch=master)](https://github.com/mrworf/pika2mqtt/actions/workflows/docker-image.yml)
+[![Container image](https://img.shields.io/badge/GHCR-pika2mqtt-2ea44f?logo=github)](https://github.com/mrworf/pika2mqtt/pkgs/container/pika2mqtt)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
 Pika to MQTT reads a Pika Energy/Generac PWRcell inverter's local installer API
 and publishes its power data to MQTT. Everything stays on the local network; no
 Generac cloud service is involved.
@@ -26,7 +30,7 @@ docker run -d \
   -e BASETOPIC=house/energy \
   -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
-  mrworf/pika2mqtt:latest
+  ghcr.io/mrworf/pika2mqtt:latest
 ```
 
 Obtain the inverter's ED25519 host-key fingerprint from a trusted LAN before
@@ -56,6 +60,11 @@ The supervisor detects SSH exits and unusable tunnels, uses SSH keepalives,
 retries with jittered exponential backoff capped at 60 seconds, and resumes
 polling automatically after an inverter reboot or network outage.
 
+The CI workflow tests every branch and pull request. Successful pushes to
+`master` publish `linux/amd64` and `linux/arm64` images to GitHub Container
+Registry as `latest`, `master`, and an immutable `sha-<commit>` tag. A tag such
+as `v1.2.3` publishes the corresponding container tag as well.
+
 ## Migrating an existing Docker installation
 
 Releases using the resilient SSH tunnel are not drop-in replacements for the
@@ -69,6 +78,8 @@ reconfigured. The transport requirements have changed:
 - The Docker host must reach the inverter on TCP/22.
 - The container no longer connects to or maintains port 8000 on the inverter.
 - `-t` is no longer required when starting the container.
+- Published images now use `ghcr.io/mrworf/pika2mqtt`; replace the previous
+  `mrworf/pika2mqtt` Docker Hub image name in Docker or Compose configurations.
 
 Before updating, retain the old container or its Compose configuration so it
 can be restored. Stop the old container before starting the new version; an old
@@ -91,7 +102,7 @@ Pull the new image, preserve the stopped old container for rollback, and create
 the replacement with the additional fingerprint setting:
 
 ```sh
-docker pull mrworf/pika2mqtt:latest
+docker pull ghcr.io/mrworf/pika2mqtt:latest
 docker stop pika2mqtt
 docker rename pika2mqtt pika2mqtt-pre-ssh-tunnel
 
@@ -103,7 +114,7 @@ docker run -d \
   -e BASETOPIC=house/energy \
   -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
-  mrworf/pika2mqtt:latest
+  ghcr.io/mrworf/pika2mqtt:latest
 ```
 
 Carry over any existing MQTT credentials, `IGNORE`, `DEBUG`, custom `IDRSA`, or
@@ -118,7 +129,7 @@ minimal complete service is:
 ```yaml
 services:
   pika2mqtt:
-    image: mrworf/pika2mqtt:latest
+    image: ghcr.io/mrworf/pika2mqtt:latest
     container_name: pika2mqtt
     restart: unless-stopped
     environment:
@@ -200,7 +211,7 @@ docker run -d \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
   -v /secure/path/pika-web-password:/run/secrets/pika-web-password:ro \
   -p 8000:8000 \
-  mrworf/pika2mqtt:latest
+  ghcr.io/mrworf/pika2mqtt:latest
 ```
 
 Open `http://<docker-host>:8000/` and enter the configured Basic Auth

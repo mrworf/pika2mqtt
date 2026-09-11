@@ -1,47 +1,104 @@
-name: Docker Image CI
+name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
-    branches: [ "master" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: pika2mqtt
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-
-  build:
-
+  quality-gates:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v3
-    - name: Install dependencies
-      run: pip install requests paho-mqtt
-    - name: Run unit tests
-      run: python3 -m unittest discover -s tests -v
-    - name: Run pika2mqtt.py
-      run: |
-        python3 -c "
-        import subprocess
-        ret = subprocess.run(['python3', 'pika2mqtt.py']).returncode
-        if ret != 2:
-            raise SystemExit(ret)
-        "
-    - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)
+      - name: Checkout
+        uses: actions/checkout@v5
 
-  publish:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check command-line validation
+        run: |
+          python - <<'PY'
+          import subprocess
+
+          result = subprocess.run(["python", "pika2mqtt.py"], check=False)
+          if result.returncode != 2:
+              raise SystemExit(
+                  f"expected missing arguments to exit 2, got {result.returncode}"
+              )
+          PY
+
+  docker-image:
+    needs: quality-gates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
-      -
-        name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Build and push Main web app container image to registry
-        uses: docker/build-push-action@v5
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: >-
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/login-action@v4
         with:
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/pika2mqtt:latest
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+          labels: |
+            org.opencontainers.image.title=Pika to MQTT
+            org.opencontainers.image.description=Publish local Generac PWRcell inverter data to MQTT
+            org.opencontainers.image.licenses=GPL-3.0-only
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
           file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: >-
+            ${{ github.event_name == 'push' &&
+                (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=pika2mqtt
+          cache-to: type=gha,mode=max,scope=pika2mqtt

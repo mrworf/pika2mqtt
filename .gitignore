@@ -1,4 +1,6 @@
 run.sh
+__pycache__/
+*.pyc
 
 # Local production credential; never commit this file.
 /pika-rsa
