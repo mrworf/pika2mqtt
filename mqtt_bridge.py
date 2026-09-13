@@ -258,6 +258,7 @@ class MqttBridge:
             "inverter_power": self._sensor(root, "power_w", "Inverter power", inverter_topic, availability=parent_availability, object_key="inverter_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
             "inverter_energy": self._sensor(root, "accumulated_energy_kwh", "Inverter accumulated energy", inverter_topic, availability=parent_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing", entity_category="diagnostic", enabled_by_default=False),
             "inverter_status": self._sensor(root, "status", "Inverter status", inverter_topic, availability=parent_availability),
+            "system_operating_mode": self._sensor(root, "system_operating_mode", "System Operating Mode", inverter_topic, availability=parent_availability),
             "grid_power": self._sensor(root, "power_w", "Grid power", grid_topic, availability=parent_availability, object_key="grid_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
             "grid_import_power": self._sensor(root, "import_power_w", "Grid import power", grid_topic, availability=parent_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
             "grid_export_power": self._sensor(root, "export_power_w", "Grid export power", grid_topic, availability=parent_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),

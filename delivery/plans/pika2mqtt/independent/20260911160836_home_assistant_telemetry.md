@@ -14,6 +14,7 @@ separate persistent inventory, and never modifies the inverter or SSH key.
 2. [MQTT reliability and Home Assistant discovery](20260911160836_home_assistant_telemetry_slice_02.md)
 3. [Container configuration and migration documentation](20260911160836_home_assistant_telemetry_slice_03.md)
 4. [Final recovery and frozen-inventory hardening](20260911160836_home_assistant_telemetry_slice_04.md)
+5. [System operating mode telemetry](20260911160836_home_assistant_telemetry_slice_05.md)
 
 ## Shared acceptance criteria
 

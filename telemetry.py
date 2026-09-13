@@ -171,6 +171,40 @@ PV_ERROR_BITS = (
     "hardware_version_mismatch",
 )
 
+SYSTEM_OPERATING_MODES = {
+    0: (
+        "SAFETY_SHUTDOWN",
+        "Safety Shutdown",
+        "All devices disabled and DC bus de-energized.",
+    ),
+    1: (
+        "GRID_TIE",
+        "Grid Tie",
+        "Support local loads and export solar power to the utility grid.",
+    ),
+    2: (
+        "SELF_SUPPLY",
+        "Self Supply",
+        "Utilize both solar power and battery power to support local loads before exporting surplus solar to utility grid.",
+    ),
+    3: (
+        "CLEAN_BACKUP",
+        "Clean Backup",
+        "Charge batteries from solar only before supporting local loads and exporting to utility grid.",
+    ),
+    4: (
+        "PRIORITY_BACKUP",
+        "Priority Backup",
+        "Charge batteries with both solar and the utility grid.",
+    ),
+    5: ("REMOTE_ARBITRAGE", "Remote Arbitrage", None),
+    6: (
+        "SELL",
+        "Sell",
+        "Export full capacity, including battery power, to utility grid.",
+    ),
+}
+
 
 def decode_rebus_state(value: Any) -> dict[str, Any]:
     try:
@@ -183,6 +217,28 @@ def decode_rebus_state(value: Any) -> dict[str, Any]:
         (f"unknown_0x{code:04x}", "error" if 0x7000 <= code <= 0x7FF0 else "warning"),
     )
     return {"status": name, "status_code": code, "status_code_hex": f"0x{code:04X}", "status_severity": severity}
+
+
+def decode_system_operating_mode(value: Any) -> dict[str, Any]:
+    if isinstance(value, bool):
+        code = None
+    else:
+        try:
+            code = int(value)
+        except (TypeError, ValueError):
+            code = None
+    if code is None:
+        key, label, description = None, None, None
+    elif code in SYSTEM_OPERATING_MODES:
+        key, label, description = SYSTEM_OPERATING_MODES[code]
+    else:
+        key, label, description = f"UNKNOWN_{code}", f"Unknown ({code})", None
+    return {
+        "system_operating_mode": label,
+        "system_operating_mode_key": key,
+        "system_operating_mode_code": code,
+        "system_operating_mode_description": description,
+    }
 
 
 def _fixed(model: Any) -> dict[str, Any]:
@@ -422,6 +478,9 @@ class InstallerTelemetry:
         state = self._base_device(serial, kind, now)
         self._apply_rebus(state)
         models = state.get("raw_models", {})
+        if kind == "inverter":
+            inverter_status = _fixed(models.get("inverter_status"))
+            state.update(decode_system_operating_mode(inverter_status.get("SysMd")))
         if kind == "battery":
             battery = _fixed(models.get("battery"))
             source = self._last_devices.get(serial, {})

@@ -324,7 +324,10 @@ house/energy/availability/pv/00010003119C
 
 Home Assistant discovery creates one PWRcell inverter/system device, a battery
 child, and one child per learned PV Link. Principal power, battery, energy,
-status, connectivity, SnapRS, and PVRSS measurements are exposed directly.
+status, connectivity, SnapRS, and PVRSS measurements are exposed directly. The
+inverter includes an enabled `System Operating Mode` sensor decoded from
+`SysMd` (for example, `Clean Backup`), while its stable enum key, numeric code,
+and model description remain available in the inverter JSON.
 Every scalar supplied by the detailed installer models is also available as a
 disabled-by-default diagnostic entity.
 

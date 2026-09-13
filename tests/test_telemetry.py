@@ -6,7 +6,13 @@ from unittest import mock
 
 import requests
 
-from telemetry import InstallerTelemetry, InventoryError, PvInventory, decode_rebus_state
+from telemetry import (
+    InstallerTelemetry,
+    InventoryError,
+    PvInventory,
+    decode_rebus_state,
+    decode_system_operating_mode,
+)
 
 
 class Response:
@@ -95,6 +101,34 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(snapshot["grid"]["export_energy_kwh"], 41917.264)
             self.assertEqual(snapshot["batteries"][0]["state_of_charge_percent"], 29.9)
             self.assertEqual(snapshot["system"]["solar_power_w"], 312)
+            inverter = snapshot["inverter"]
+            self.assertEqual(inverter["system_operating_mode"], "Clean Backup")
+            self.assertEqual(inverter["system_operating_mode_key"], "CLEAN_BACKUP")
+            self.assertEqual(inverter["system_operating_mode_code"], 3)
+            self.assertEqual(
+                inverter["system_operating_mode_description"],
+                "Charge batteries from solar only before supporting local loads and exporting to utility grid.",
+            )
+
+    def test_unknown_and_missing_system_operating_modes_remain_observable(self):
+        self.assertEqual(
+            decode_system_operating_mode(99),
+            {
+                "system_operating_mode": "Unknown (99)",
+                "system_operating_mode_key": "UNKNOWN_99",
+                "system_operating_mode_code": 99,
+                "system_operating_mode_description": None,
+            },
+        )
+        self.assertEqual(
+            decode_system_operating_mode(None),
+            {
+                "system_operating_mode": None,
+                "system_operating_mode_key": None,
+                "system_operating_mode_code": None,
+                "system_operating_mode_description": None,
+            },
+        )
 
     def test_model_failure_backs_off_without_disconnect(self):
         with tempfile.TemporaryDirectory() as directory:

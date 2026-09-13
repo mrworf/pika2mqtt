@@ -42,7 +42,7 @@ def snapshot():
     return {
         "api_connected": True,
         "system": {"solar_power_w": 1200, "learned_string_count": 1, "connected_string_count": 1, "disconnected_string_count": 0, "faulted_string_count": 0, "unknown_fault_string_count": 0, "any_string_disconnected": False, "any_string_faulted": False, "untracked_pv_link_count": 0, "untracked_pv_links": []},
-        "inverter": {"serial": "0001000706FA", "power_w": 1000, "accumulated_energy_kwh": 42, "status": "making_power"},
+        "inverter": {"serial": "0001000706FA", "power_w": 1000, "accumulated_energy_kwh": 42, "status": "making_power", "system_operating_mode": "Clean Backup"},
         "grid": {"power_w": 500, "import_power_w": 0, "export_power_w": 500, "import_energy_kwh": 2, "export_energy_kwh": 41},
         "batteries": [{"serial": "000100080701", "power_w": -100, "input_power_w": 100, "output_power_w": 0, "state_of_charge_percent": 90.5, "status": "charging_battery"}],
         "pv_links": {"00010003119C": {"serial": "00010003119C", "connected": True, "fault": False, "power_w": 1200, "status": "making_power", "last_heard_seconds": 2}},
@@ -82,6 +82,9 @@ class MqttBridgeTests(unittest.TestCase):
         parent = decoded[parent_topic]
         self.assertIn("any_string_disconnected", parent["components"])
         self.assertIn("any_string_faulted", parent["components"])
+        mode = parent["components"]["system_operating_mode"]
+        self.assertEqual(mode["name"], "System Operating Mode")
+        self.assertEqual(mode["value_template"], "{{ value_json.system_operating_mode }}")
         child = decoded["homeassistant/device/pika2mqtt_pv_00010003119c/config"]
         self.assertEqual(child["device"]["via_device"], "pika2mqtt_0001000706fa")
         self.assertIn("disconnected", child["components"])
