@@ -320,7 +320,13 @@ Availability uses:
 house/energy/availability/service
 house/energy/availability/inverter
 house/energy/availability/pv/00010003119C
+house/energy/availability/power/solar
+house/energy/availability/power/pv/00010003119C
 ```
+
+Power-specific availability uses `available` and `unavailable`. It lets Home
+Assistant suppress only a bad power measurement without treating the inverter
+or PV Link as disconnected.
 
 Home Assistant discovery creates one PWRcell inverter/system device, a battery
 child, and one child per learned PV Link. Principal power, battery, energy,
@@ -337,6 +343,15 @@ nonnegative import/export and charge/discharge sensors are also provided. Grid
 import/export energy comes from the inverter's native `REbus_exp` `Whin` and
 `Whx` counters. Other device energy counters are labeled accumulated energy
 rather than being misrepresented as solar production.
+
+PV Link production is accepted only when it is a finite value from 0 W through
+5000 W inclusive. Negative values, higher spikes, non-finite values, and missing
+samples are omitted rather than clamped or cached. The affected string power
+sensor becomes unavailable while its other telemetry remains usable. If any
+visible string has an invalid primary sample, aggregate solar power is also
+omitted and unavailable instead of reporting a partial total. The container
+logs one warning when a string enters an invalid-data episode and an
+informational message when valid power resumes.
 
 Each PV Link has independent connectivity and fault signals. Connectivity is
 based on `/devices` presence and `lastheard`; a string becomes disconnected

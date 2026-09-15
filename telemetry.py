@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -14,6 +16,7 @@ import requests
 
 
 LOG = logging.getLogger(__name__)
+PV_POWER_MAX_W = 5000
 
 
 class InventoryError(ValueError):
@@ -254,6 +257,15 @@ def _number(data: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def _valid_pv_power(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0 <= value <= PV_POWER_MAX_W
+    )
+
+
 class InstallerTelemetry:
     """Collects installer API data and returns one normalized snapshot."""
 
@@ -285,6 +297,7 @@ class InstallerTelemetry:
         self._failures: dict[tuple[str, str], int] = {}
         self._last_devices: dict[str, dict[str, Any]] = {}
         self._last_devices_success: float | None = None
+        self._invalid_pv_power_serials: set[str] = set()
 
     def _get_json(self, path: str) -> dict[str, Any]:
         try:
@@ -431,9 +444,30 @@ class InstallerTelemetry:
             "rebus_bits": rebus.get("RB"),
         })
 
-    def _pv_state(self, serial: str, now: float) -> dict[str, Any]:
+    def _pv_state(self, serial: str, now: float) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
         state = self._base_device(serial, "pv", now)
+        issues = []
+        source = self._last_devices.get(serial)
+        raw_power = source.get("power") if source else None
+        if source is None or not _valid_pv_power(raw_power):
+            state.pop("power_w", None)
+            state.pop("input_power_w", None)
+            state.pop("output_power_w", None)
+            if source is not None:
+                issues.append(("devices.power", raw_power))
+
+        # PV raw models are published as diagnostics, so work on a copy before
+        # removing an impossible detailed power value from the public snapshot.
+        if "raw_models" in state:
+            state["raw_models"] = copy.deepcopy(state["raw_models"])
+        rebus = _fixed(state.get("raw_models", {}).get("REbus_status"))
+        invalid_rebus_power = source is not None and "P" in rebus and not _valid_pv_power(rebus["P"])
+        if invalid_rebus_power:
+            issues.append(("REbus_status.P", rebus["P"]))
+            del rebus["P"]
         self._apply_rebus(state)
+        if invalid_rebus_power:
+            state.pop("rebus_power_w", None)
         pv = _fixed(state.get("raw_models", {}).get("pvlink_status"))
         pvrss = _fixed(state.get("raw_models", {}).get("pvrss_telemetry"))
         result = pvrss.get("SelfTestResults")
@@ -472,7 +506,27 @@ class InstallerTelemetry:
             if state["fault_reasons"]
             else ("none" if assessment_complete else "unknown")
         )
-        return state
+        return state, issues
+
+    def _update_pv_power_warnings(
+        self,
+        issues: dict[str, list[tuple[str, Any]]],
+        visible_serials: set[str],
+    ) -> None:
+        invalid_serials = set(issues)
+        for serial in sorted(invalid_serials.difference(self._invalid_pv_power_serials)):
+            details = ", ".join(f"{source}={value!r}" for source, value in issues[serial])
+            LOG.warning(
+                "Rejecting invalid PV power for %s (%s); accepted range is 0-%s W",
+                serial,
+                details,
+                PV_POWER_MAX_W,
+            )
+        for serial in sorted(
+            self._invalid_pv_power_serials.difference(invalid_serials).intersection(visible_serials)
+        ):
+            LOG.info("PV power for %s recovered to a valid sample", serial)
+        self._invalid_pv_power_serials = invalid_serials
 
     def _generic_state(self, serial: str, kind: str, now: float) -> dict[str, Any]:
         state = self._base_device(serial, kind, now)
@@ -500,11 +554,15 @@ class InstallerTelemetry:
             self._last_devices_success is not None
             and now - self._last_devices_success <= self.disconnect_after
         )
-        pvs = {
-            serial: self._pv_state(serial, now)
-            for serial in self.inventory.serials
-            if serial not in self.ignored
-        }
+        pvs = {}
+        power_issues: dict[str, list[tuple[str, Any]]] = {}
+        for serial in self.inventory.serials:
+            if serial in self.ignored:
+                continue
+            state, issues = self._pv_state(serial, now)
+            pvs[serial] = state
+            if issues:
+                power_issues[serial] = issues
         inverters = [
             self._generic_state(serial, "inverter", now)
             for serial, item in self._last_devices.items()
@@ -539,26 +597,37 @@ class InstallerTelemetry:
             for serial, item in self._last_devices.items()
             if item["kind"] == "pv" and serial not in self.ignored
         }
+        for serial in visible_pv_serials:
+            raw_power = self._last_devices[serial].get("power")
+            if not _valid_pv_power(raw_power):
+                issue = ("devices.power", raw_power)
+                if issue not in power_issues.setdefault(serial, []):
+                    power_issues[serial].append(issue)
+        self._update_pv_power_warnings(power_issues, visible_pv_serials)
         untracked = sorted(visible_pv_serials.difference(self.inventory.serials))
-        solar_power = sum(
-            max(0, _number(self._last_devices[serial], "power") or 0)
+        primary_power_valid = all(
+            _valid_pv_power(self._last_devices[serial].get("power"))
             for serial in visible_pv_serials
         )
+        system = {
+            "learned_string_count": len(pvs),
+            "connected_string_count": connected,
+            "disconnected_string_count": len(pvs) - connected,
+            "faulted_string_count": faulted,
+            "unknown_fault_string_count": unknown_faults,
+            "any_string_disconnected": connected != len(pvs),
+            "any_string_faulted": faulted > 0,
+            "untracked_pv_link_count": len(untracked),
+            "untracked_pv_links": untracked,
+        }
+        if primary_power_valid:
+            system["solar_power_w"] = sum(
+                self._last_devices[serial]["power"] for serial in visible_pv_serials
+            )
         return {
             "timestamp": int(now),
             "api_connected": api_connected,
-            "system": {
-                "solar_power_w": solar_power,
-                "learned_string_count": len(pvs),
-                "connected_string_count": connected,
-                "disconnected_string_count": len(pvs) - connected,
-                "faulted_string_count": faulted,
-                "unknown_fault_string_count": unknown_faults,
-                "any_string_disconnected": connected != len(pvs),
-                "any_string_faulted": faulted > 0,
-                "untracked_pv_link_count": len(untracked),
-                "untracked_pv_links": untracked,
-            },
+            "system": system,
             "inverter": inverter,
             "grid": grid,
             "batteries": batteries,

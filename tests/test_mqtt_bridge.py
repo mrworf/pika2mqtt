@@ -71,6 +71,63 @@ class MqttBridgeTests(unittest.TestCase):
         self.assertEqual(json.loads(state[0][1])["solar_power_w"], 1200)
         self.assertIn(("homeassistant/status", 1), self.client.subscribed)
 
+    def test_invalid_power_is_omitted_and_only_power_availability_changes(self):
+        data = snapshot()
+        data["system"].pop("solar_power_w")
+        data["pv_links"]["00010003119C"].pop("power_w")
+        self.bridge.publish_snapshot(data)
+        self.connect()
+
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        self.assertIn(("house/energy/availability/power/solar", "unavailable"), values)
+        self.assertIn(
+            ("house/energy/availability/power/pv/00010003119C", "unavailable"),
+            values,
+        )
+        self.assertIn(("house/energy/availability/pv/00010003119C", "connected"), values)
+
+        system_payload = next(
+            payload for topic, payload, _, _ in self.client.published
+            if topic == "house/energy/state/system"
+        )
+        pv_payload = next(
+            payload for topic, payload, _, _ in self.client.published
+            if topic == "house/energy/state/pv/00010003119C"
+        )
+        self.assertNotIn("solar_power_w", json.loads(system_payload))
+        self.assertNotIn("power_w", json.loads(pv_payload))
+        self.assertEqual(json.loads(pv_payload)["status"], "making_power")
+
+        configs = {
+            topic: json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic.startswith("homeassistant/device/")
+        }
+        parent = configs["homeassistant/device/pika2mqtt_0001000706fa/config"]
+        pv = configs["homeassistant/device/pika2mqtt_pv_00010003119c/config"]
+        self.assertEqual(
+            parent["components"]["solar_power"]["availability"][-1],
+            {
+                "topic": "house/energy/availability/power/solar",
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            },
+        )
+        self.assertEqual(
+            pv["components"]["power"]["availability"][-1]["topic"],
+            "house/energy/availability/power/pv/00010003119C",
+        )
+
+    def test_valid_power_publishes_available_quality_topics(self):
+        self.bridge.publish_snapshot(snapshot())
+        self.connect()
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        self.assertIn(("house/energy/availability/power/solar", "available"), values)
+        self.assertIn(
+            ("house/energy/availability/power/pv/00010003119C", "available"),
+            values,
+        )
+
     def test_discovery_has_parent_battery_and_pv_child_with_separate_health(self):
         self.bridge.publish_snapshot(snapshot())
         self.connect()

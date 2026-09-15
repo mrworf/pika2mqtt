@@ -129,6 +129,10 @@ class MqttBridge:
             self._topic("availability/inverter"),
             "connected" if snapshot["api_connected"] else "disconnected",
         )
+        self._publish(
+            self._topic("availability/power/solar"),
+            "available" if "solar_power_w" in snapshot["system"] else "unavailable",
+        )
         self._publish(self._topic("state/system"), self._json(snapshot["system"]))
         if snapshot.get("inverter") is not None:
             self._publish(self._topic("state/inverter"), self._json(snapshot["inverter"]))
@@ -142,6 +146,10 @@ class MqttBridge:
             self._publish(
                 self._topic(f"availability/pv/{serial}"),
                 "connected" if pv["connected"] else "disconnected",
+            )
+            self._publish(
+                self._topic(f"availability/power/pv/{serial}"),
+                "available" if "power_w" in pv else "unavailable",
             )
             self._publish(self._topic(f"state/pv/{serial}"), self._json(pv))
 
@@ -159,6 +167,13 @@ class MqttBridge:
             }
             for topic in topics
         ]
+
+    def _power_availability(self, suffix: str) -> dict[str, str]:
+        return {
+            "topic": self._topic(f"availability/power/{suffix}"),
+            "payload_available": "available",
+            "payload_not_available": "unavailable",
+        }
 
     def _component(
         self,
@@ -246,7 +261,7 @@ class MqttBridge:
         inverter_topic = self._topic("state/inverter")
         grid_topic = self._topic("state/grid")
         components = {
-            "solar_power": self._sensor(root, "solar_power_w", "Solar power", system_topic, availability=parent_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
+            "solar_power": self._sensor(root, "solar_power_w", "Solar power", system_topic, availability=parent_availability + [self._power_availability("solar")], device_class="power", unit_of_measurement="W", state_class="measurement"),
             "learned_strings": self._sensor(root, "learned_string_count", "Learned strings", system_topic, availability=service_availability, entity_category="diagnostic"),
             "connected_strings": self._sensor(root, "connected_string_count", "Connected strings", system_topic, availability=service_availability, entity_category="diagnostic"),
             "disconnected_strings": self._sensor(root, "disconnected_string_count", "Disconnected strings", system_topic, availability=service_availability, entity_category="diagnostic"),
@@ -305,11 +320,12 @@ class MqttBridge:
         topic = self._topic(f"state/pv/{serial}")
         connected_availability = self._availability()
         measurement_availability = self._availability(pv_serial=serial)
+        power_availability = measurement_availability + [self._power_availability(f"pv/{serial}")]
         components = {
             "disconnected": self._component("binary_sensor", f"{child}_disconnected", "Disconnected", topic, "{{ 'OFF' if value_json.connected else 'ON' }}", connected_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
             "fault": self._component("binary_sensor", f"{child}_fault", "Fault", topic, "{{ 'ON' if value_json.fault == true else ('OFF' if value_json.fault == false else 'UNKNOWN') }}", measurement_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
             "fault_summary": self._sensor(child, "fault_summary", "Fault summary", topic, availability=measurement_availability, entity_category="diagnostic"),
-            "power": self._sensor(child, "power_w", "Power", topic, availability=measurement_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
+            "power": self._sensor(child, "power_w", "Power", topic, availability=power_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
             "input_voltage": self._sensor(child, "input_voltage_v", "Input voltage", topic, availability=measurement_availability, device_class="voltage", unit_of_measurement="V", state_class="measurement"),
             "input_current": self._sensor(child, "input_current_a", "Input current", topic, availability=measurement_availability, device_class="current", unit_of_measurement="A", state_class="measurement"),
             "energy": self._sensor(child, "accumulated_energy_kwh", "Accumulated energy", topic, availability=measurement_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),

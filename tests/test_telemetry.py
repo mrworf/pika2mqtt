@@ -110,6 +110,85 @@ class TelemetryTests(unittest.TestCase):
                 "Charge batteries from solar only before supporting local loads and exporting to utility grid.",
             )
 
+    def test_pv_power_accepts_zero_and_five_kw_boundaries(self):
+        for power in (0, 312, 5000):
+            with self.subTest(power=power), tempfile.TemporaryDirectory() as directory:
+                devices = self.fixture("devices.json")
+                devices["pv"][0]["power"] = power
+                snapshot = self.collector(directory, {"/devices": devices}).poll()
+                pv = snapshot["pv_links"]["000100030001"]
+                self.assertEqual(pv["power_w"], power)
+                self.assertEqual(snapshot["system"]["solar_power_w"], power)
+
+    def test_invalid_primary_pv_power_is_omitted_with_aggregate(self):
+        invalid_values = (-1, 5000.1, float("nan"), float("inf"), None)
+        for power in invalid_values:
+            with self.subTest(power=power), tempfile.TemporaryDirectory() as directory:
+                devices = self.fixture("devices.json")
+                if power is None:
+                    devices["pv"][0].pop("power")
+                else:
+                    devices["pv"][0]["power"] = power
+                with self.assertLogs("telemetry", level="WARNING") as logs:
+                    snapshot = self.collector(directory, {"/devices": devices}).poll()
+                pv = snapshot["pv_links"]["000100030001"]
+                self.assertNotIn("power_w", pv)
+                self.assertNotIn("input_power_w", pv)
+                self.assertNotIn("output_power_w", pv)
+                self.assertNotIn("solar_power_w", snapshot["system"])
+                self.assertTrue(pv["connected"])
+                self.assertIn("Rejecting invalid PV power", "\n".join(logs.output))
+
+    def test_invalid_pv_power_warns_once_redacts_raw_and_logs_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1000]
+            devices = self.fixture("devices.json")
+            devices["pv"][0]["power"] = -12
+            rebus = self.fixture("rebus_status.json")
+            rebus["fixed"]["P"] = 6000
+            routes = {
+                "/devices": devices,
+                "/device/3/model/common": {"fixed": {}},
+                "/device/3/model/REbus_status": rebus,
+                "/device/3/model/pvlink_status": self.fixture("pvlink_status.json"),
+                "/device/3/model/pvrss_telemetry": self.fixture("pvrss_telemetry.json"),
+            }
+            collector = self.collector(directory, routes)
+            collector.clock = lambda: now[0]
+
+            with self.assertLogs("telemetry", level="WARNING") as first_logs:
+                invalid = collector.poll()
+            warnings = [line for line in first_logs.output if "Rejecting invalid PV power" in line]
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("devices.power=-12", warnings[0])
+            self.assertIn("REbus_status.P=6000", warnings[0])
+            pv = invalid["pv_links"]["000100030001"]
+            self.assertNotIn("rebus_power_w", pv)
+            self.assertNotIn("P", pv["raw_models"]["REbus_status"]["fixed"])
+
+            with self.assertNoLogs("telemetry", level="INFO"):
+                collector.poll()
+
+            devices["pv"][0]["power"] = 400
+            rebus["fixed"]["P"] = 400
+            now[0] = 1060
+            with self.assertLogs("telemetry", level="INFO") as recovery_logs:
+                recovered = collector.poll()
+            self.assertIn("recovered to a valid sample", "\n".join(recovery_logs.output))
+            self.assertEqual(recovered["pv_links"]["000100030001"]["power_w"], 400)
+            self.assertEqual(recovered["system"]["solar_power_w"], 400)
+
+    def test_one_invalid_visible_string_suppresses_total_without_hiding_valid_string(self):
+        with tempfile.TemporaryDirectory() as directory:
+            devices = self.fixture("devices.json")
+            second = dict(devices["pv"][0], rcpn="000100030002", modID=4, power=5100)
+            devices["pv"].append(second)
+            with self.assertLogs("telemetry", level="WARNING"):
+                snapshot = self.collector(directory, {"/devices": devices}).poll()
+            self.assertEqual(snapshot["pv_links"]["000100030001"]["power_w"], 312)
+            self.assertNotIn("power_w", snapshot["pv_links"]["000100030002"])
+            self.assertNotIn("solar_power_w", snapshot["system"])
+
     def test_unknown_and_missing_system_operating_modes_remain_observable(self):
         self.assertEqual(
             decode_system_operating_mode(99),
