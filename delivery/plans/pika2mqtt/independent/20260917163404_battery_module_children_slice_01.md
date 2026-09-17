@@ -1,6 +1,7 @@
 # Slice 01: Collect and publish battery module children
 
 Parent commit: `55ee1df53ffa34c5f56867f23d8b3bafb80b56a3`
+Payload commit: `949a1fa785f842b046061968ab16a05571f23a62`
 
 ## Goal and observable outcome
 
