@@ -23,6 +23,10 @@ class InventoryError(ValueError):
     """The persistent PV Link inventory cannot be used safely."""
 
 
+class OperatingModeError(RuntimeError):
+    """A requested inverter operating-mode change was not confirmed."""
+
+
 class PvInventory:
     VERSION = 1
 
@@ -207,6 +211,11 @@ SYSTEM_OPERATING_MODES = {
         "Export full capacity, including battery power, to utility grid.",
     ),
 }
+WRITABLE_SYSTEM_OPERATING_MODE_CODES = frozenset({1, 2, 3, 4})
+SYSTEM_OPERATING_MODE_COMMANDS = {
+    SYSTEM_OPERATING_MODES[code][1]: code
+    for code in sorted(WRITABLE_SYSTEM_OPERATING_MODE_CODES)
+}
 
 
 def decode_rebus_state(value: Any) -> dict[str, Any]:
@@ -282,6 +291,7 @@ class InstallerTelemetry:
         disconnect_after: int = 120,
         clock: Callable[[], float] = time.time,
         request_get: Callable[..., Any] = requests.get,
+        request_post: Callable[..., Any] = requests.post,
     ):
         self.base_url = base_url.rstrip("/")
         self.inventory = inventory
@@ -291,6 +301,7 @@ class InstallerTelemetry:
         self.disconnect_after = disconnect_after
         self.clock = clock
         self.request_get = request_get
+        self.request_post = request_post
         self._details: dict[tuple[str, str], dict[str, Any]] = {}
         self._endpoint_health: dict[tuple[str, str], dict[str, Any]] = {}
         self._next_detail: dict[tuple[str, str], float] = {}
@@ -314,6 +325,58 @@ class InstallerTelemetry:
         if self.transport:
             self.transport.report_success()
         return payload
+
+    def _post_form(self, path: str, data: dict[str, str]) -> None:
+        try:
+            response = self.request_post(self.base_url + path, data=data, timeout=5)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
+            if self.transport:
+                self.transport.report_transport_failure(error)
+            raise
+        if not 200 <= response.status_code < 300:
+            raise requests.exceptions.HTTPError(f"HTTP {response.status_code} for {path}")
+        if self.transport:
+            self.transport.report_success()
+
+    def set_system_operating_mode(self, code: int) -> dict[str, Any]:
+        if (
+            not isinstance(code, int)
+            or isinstance(code, bool)
+            or code not in WRITABLE_SYSTEM_OPERATING_MODE_CODES
+        ):
+            raise OperatingModeError(f"operating mode code {code!r} is not writable")
+        inverter = next(
+            (
+                (serial, device)
+                for serial, device in self._last_devices.items()
+                if device["kind"] == "inverter" and serial not in self.ignored
+            ),
+            None,
+        )
+        if inverter is None:
+            raise OperatingModeError("no inverter is currently available")
+        serial, device = inverter
+        path = f"/device/{int(device['modID'])}/model/inverter_status"
+        try:
+            self._post_form(path, {"SysMd": str(code)})
+            readback = self._get_json(path)
+        except (requests.RequestException, ValueError, TypeError) as error:
+            raise OperatingModeError(f"operating mode request failed: {error}") from error
+        confirmed = _fixed(readback).get("SysMd")
+        if isinstance(confirmed, bool) or not isinstance(confirmed, (int, float)):
+            raise OperatingModeError("operating mode readback did not contain a numeric SysMd")
+        if confirmed != code:
+            raise OperatingModeError(
+                f"operating mode readback was {confirmed!r}, expected {code}"
+            )
+
+        now = self.clock()
+        key = (serial, "inverter_status")
+        self._details[key] = readback
+        self._failures[key] = 0
+        self._next_detail[key] = now + self.detail_interval
+        self._endpoint_health[key] = {"available": True, "last_success": int(now)}
+        return self._snapshot(now)
 
     @staticmethod
     def _kind(group: str, entry: dict[str, Any]) -> str:

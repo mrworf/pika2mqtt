@@ -147,6 +147,105 @@ class MqttBridgeTests(unittest.TestCase):
         self.assertIn("disconnected", child["components"])
         self.assertIn("fault", child["components"])
 
+    def test_operating_mode_control_is_absent_and_unsubscribed_by_default(self):
+        self.bridge.publish_snapshot(snapshot())
+        self.connect()
+        parent = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic == "homeassistant/device/pika2mqtt_0001000706fa/config"
+        )
+        self.assertNotIn("system_operating_mode_control", parent["components"])
+        self.assertNotIn(
+            ("house/energy/command/system_operating_mode", 1),
+            self.client.subscribed,
+        )
+
+    def test_enabled_operating_mode_control_discovers_select_and_subscribes(self):
+        bridge = MqttBridge(
+            self.client,
+            "house/energy",
+            "inverter.local",
+            operating_mode_control_enabled=True,
+        )
+        bridge.publish_snapshot(snapshot())
+        bridge.on_connect(self.client, None, None, 0)
+        self.assertIn(
+            ("house/energy/command/system_operating_mode", 1),
+            self.client.subscribed,
+        )
+        parent = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic == "homeassistant/device/pika2mqtt_0001000706fa/config"
+        )
+        self.assertIn("system_operating_mode", parent["components"])
+        control = parent["components"]["system_operating_mode_control"]
+        self.assertEqual(control["platform"], "select")
+        self.assertEqual(
+            control["command_topic"],
+            "house/energy/command/system_operating_mode",
+        )
+        self.assertEqual(
+            control["options"],
+            ["Grid Tie", "Self Supply", "Clean Backup", "Priority Backup"],
+        )
+        self.assertFalse(control["optimistic"])
+        self.assertFalse(control["retain"])
+        self.assertEqual(control["value_template"], "{{ value_json.system_operating_mode }}")
+
+    def test_operating_mode_commands_validate_and_dispatch_exact_options(self):
+        calls = []
+        bridge = MqttBridge(
+            self.client,
+            "house/energy",
+            "inverter.local",
+            operating_mode_control_enabled=True,
+        )
+        bridge.set_operating_mode_command_handler(
+            lambda label, code: calls.append((label, code))
+        )
+        topic = "house/energy/command/system_operating_mode"
+        for label, code in (
+            ("Grid Tie", 1),
+            ("Self Supply", 2),
+            ("Clean Backup", 3),
+            ("Priority Backup", 4),
+        ):
+            bridge.on_message(
+                self.client,
+                None,
+                types.SimpleNamespace(topic=topic, payload=label.encode(), retain=False),
+            )
+            self.assertEqual(calls[-1], (label, code))
+
+        count = len(calls)
+        rejected = (
+            types.SimpleNamespace(topic=topic, payload=b"Sell", retain=False),
+            types.SimpleNamespace(topic=topic, payload=b" Self Supply", retain=False),
+            types.SimpleNamespace(topic=topic, payload=b"\xff", retain=False),
+            types.SimpleNamespace(topic=topic, payload=b"Grid Tie", retain=True),
+        )
+        with self.assertLogs("mqtt_bridge", level="WARNING"):
+            for message in rejected:
+                bridge.on_message(self.client, None, message)
+        self.assertEqual(len(calls), count)
+
+    def test_disabled_operating_mode_control_ignores_direct_command(self):
+        calls = []
+        self.bridge.set_operating_mode_command_handler(lambda *args: calls.append(args))
+        with self.assertLogs("mqtt_bridge", level="WARNING"):
+            self.bridge.on_message(
+                self.client,
+                None,
+                types.SimpleNamespace(
+                    topic="house/energy/command/system_operating_mode",
+                    payload=b"Self Supply",
+                    retain=False,
+                ),
+            )
+        self.assertEqual(calls, [])
+
     def test_inverter_and_string_availability_are_distinct(self):
         data = snapshot()
         data["api_connected"] = False

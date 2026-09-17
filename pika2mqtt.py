@@ -7,10 +7,11 @@ import os
 import signal
 import sys
 import threading
+import time
 
 from mqtt_bridge import MqttBridge, stable_id
 from pika_transport import SshTunnelConfig, SshTunnelSupervisor, TransportConfigurationError
-from telemetry import InstallerTelemetry, InventoryError, PvInventory
+from telemetry import InstallerTelemetry, InventoryError, OperatingModeError, PvInventory
 from web_gateway import GatewayConfigurationError, InstallerWebGateway, WebGatewayConfig, resolve_web_password
 
 
@@ -34,21 +35,68 @@ class CollectorThread(threading.Thread):
         self.transport = transport
         self.refresh = refresh
         self.stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._command_lock = threading.Lock()
+        self._pending_operating_mode = None
 
     def stop(self):
         self.stop_event.set()
+        self._wake_event.set()
+
+    def request_operating_mode(self, label, code):
+        with self._command_lock:
+            previous = self._pending_operating_mode
+            self._pending_operating_mode = (label, code)
+        if previous is not None:
+            logging.info(
+                "Replacing pending operating mode command %s with %s",
+                previous[0],
+                label,
+            )
+        self._wake_event.set()
+
+    def _take_pending_operating_mode(self):
+        with self._command_lock:
+            command = self._pending_operating_mode
+            self._pending_operating_mode = None
+        return command
+
+    def _process_pending_operating_mode(self):
+        command = self._take_pending_operating_mode()
+        if command is None:
+            return False
+        label, code = command
+        if not self.transport.wait_available(timeout=0):
+            logging.error(
+                "Operating mode command %s failed: SSH tunnel is unavailable", label
+            )
+            return False
+        try:
+            snapshot = self.telemetry.set_system_operating_mode(code)
+        except OperatingModeError as error:
+            logging.error("Operating mode command %s failed: %s", label, error)
+            return False
+        self.publisher.publish_snapshot(snapshot)
+        logging.info("Operating mode command confirmed: %s", label)
+        return True
 
     def run(self):
         logging.info("Starting the telemetry monitor")
+        next_poll = 0.0
         while not self.stop_event.is_set():
             if not self.publisher.wait_connected(timeout=1):
                 continue
-            if self.transport.wait_available(timeout=1):
-                snapshot = self.telemetry.poll()
-            else:
-                snapshot = self.telemetry.current_snapshot()
-            self.publisher.publish_snapshot(snapshot)
-            self.stop_event.wait(self.refresh)
+            self._process_pending_operating_mode()
+            if time.monotonic() >= next_poll:
+                if self.transport.wait_available(timeout=1):
+                    snapshot = self.telemetry.poll()
+                else:
+                    snapshot = self.telemetry.current_snapshot()
+                self.publisher.publish_snapshot(snapshot)
+                next_poll = time.monotonic() + self.refresh
+            wait_for = min(1.0, max(0.0, next_poll - time.monotonic()))
+            self._wake_event.wait(wait_for)
+            self._wake_event.clear()
 
 
 def build_parser():
@@ -77,6 +125,10 @@ def build_parser():
     discovery.add_argument("--no-ha-discovery", dest="ha_discovery", action="store_false")
     parser.set_defaults(ha_discovery=environment_flag("HA_DISCOVERY_ENABLED", True))
     parser.add_argument("--ha-discovery-prefix", default=os.getenv("HA_DISCOVERY_PREFIX", "homeassistant"), help="Home Assistant MQTT discovery prefix")
+    operating_mode = parser.add_mutually_exclusive_group()
+    operating_mode.add_argument("--operating-mode-control", dest="operating_mode_control", action="store_true", help="Allow Home Assistant to change approved system operating modes")
+    operating_mode.add_argument("--no-operating-mode-control", dest="operating_mode_control", action="store_false")
+    parser.set_defaults(operating_mode_control=environment_flag("OPERATING_MODE_CONTROL_ENABLED"))
     parser.add_argument("--web", action="store_true", default=environment_flag("WEB_ENABLED"), help="Enable the authenticated installer web gateway")
     parser.add_argument("--web-write", action="store_true", default=environment_flag("WEB_WRITE_ENABLED"), help="Allow write methods through the web gateway")
     parser.add_argument("--web-listen", default=os.getenv("WEB_LISTEN", "0.0.0.0"), help="Web gateway listen address")
@@ -181,6 +233,7 @@ def main(argv=None):
         fallback_system_id=args.hostname,
         discovery_enabled=args.ha_discovery,
         discovery_prefix=args.ha_discovery_prefix,
+        operating_mode_control_enabled=args.operating_mode_control,
     )
     telemetry = InstallerTelemetry(
         tunnel.base_url,
@@ -191,6 +244,7 @@ def main(argv=None):
         disconnect_after=args.disconnect_after,
     )
     monitor = CollectorThread(telemetry, publisher, tunnel, refresh=args.refresh)
+    publisher.set_operating_mode_command_handler(monitor.request_operating_mode)
     stop_event = threading.Event()
 
     def shutdown(signum=None, frame=None):

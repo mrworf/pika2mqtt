@@ -8,6 +8,8 @@ import re
 import threading
 from typing import Any
 
+from telemetry import SYSTEM_OPERATING_MODE_COMMANDS
+
 
 LOG = logging.getLogger(__name__)
 
@@ -26,12 +28,15 @@ class MqttBridge:
         fallback_system_id: str,
         discovery_enabled: bool = True,
         discovery_prefix: str = "homeassistant",
+        operating_mode_control_enabled: bool = False,
     ):
         self.client = client
         self.base_topic = base_topic.strip("/")
         self.fallback_system_id = stable_id(fallback_system_id) or "pika"
         self.discovery_enabled = discovery_enabled
         self.discovery_prefix = discovery_prefix.strip("/")
+        self.operating_mode_control_enabled = operating_mode_control_enabled
+        self.operating_mode_command_handler = None
         self.connected = threading.Event()
         self._lock = threading.RLock()
         self._latest: dict[str, Any] | None = None
@@ -69,6 +74,8 @@ class MqttBridge:
         LOG.info("MQTT broker connected")
         self.connected.set()
         client.subscribe(f"{self.discovery_prefix}/status", qos=self.QOS)
+        if self.operating_mode_control_enabled:
+            client.subscribe(self._topic("command/system_operating_mode"), qos=self.QOS)
         self._publish(self._topic("availability/service"), "connected")
         self.republish(force_discovery=True)
 
@@ -84,15 +91,40 @@ class MqttBridge:
         LOG.warning("MQTT connection attempt failed; automatic retry remains active")
 
     def on_message(self, client, userdata, message):
-        if message.topic != f"{self.discovery_prefix}/status":
+        if message.topic == f"{self.discovery_prefix}/status":
+            try:
+                status = message.payload.decode("utf-8").strip().lower()
+            except (AttributeError, UnicodeDecodeError):
+                return
+            if status == "online":
+                LOG.info("Home Assistant birth received; republishing discovery and state")
+                self.republish(force_discovery=True)
+            return
+        if message.topic != self._topic("command/system_operating_mode"):
+            return
+        if not self.operating_mode_control_enabled:
+            LOG.warning("Ignoring operating mode command while control is disabled")
+            return
+        if getattr(message, "retain", False):
+            LOG.warning("Ignoring retained operating mode command")
             return
         try:
-            status = message.payload.decode("utf-8").strip().lower()
+            label = message.payload.decode("utf-8")
         except (AttributeError, UnicodeDecodeError):
+            LOG.warning("Ignoring malformed operating mode command")
             return
-        if status == "online":
-            LOG.info("Home Assistant birth received; republishing discovery and state")
-            self.republish(force_discovery=True)
+        code = SYSTEM_OPERATING_MODE_COMMANDS.get(label)
+        if code is None:
+            LOG.warning("Ignoring unknown operating mode command: %r", label)
+            return
+        if self.operating_mode_command_handler is None:
+            LOG.error("Cannot process operating mode command: no handler is configured")
+            return
+        LOG.info("Accepted operating mode command: %s", label)
+        self.operating_mode_command_handler(label, code)
+
+    def set_operating_mode_command_handler(self, handler) -> None:
+        self.operating_mode_command_handler = handler
 
     def wait_connected(self, timeout: float | None = None) -> bool:
         return self.connected.wait(timeout)
@@ -280,6 +312,19 @@ class MqttBridge:
             "grid_import_energy": self._sensor(root, "import_energy_kwh", "Grid imported energy", grid_topic, availability=parent_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
             "grid_export_energy": self._sensor(root, "export_energy_kwh", "Grid exported energy", grid_topic, availability=parent_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
         }
+        if self.operating_mode_control_enabled:
+            components["system_operating_mode_control"] = self._component(
+                "select",
+                f"{root}_system_operating_mode_control",
+                "System Operating Mode Control",
+                inverter_topic,
+                "{{ value_json.system_operating_mode }}",
+                parent_availability,
+                command_topic=self._topic("command/system_operating_mode"),
+                options=list(SYSTEM_OPERATING_MODE_COMMANDS),
+                optimistic=False,
+                retain=False,
+            )
         components.update(self._raw_components(root, inverter_topic, inverter, parent_availability))
         self._publish_config(
             root,

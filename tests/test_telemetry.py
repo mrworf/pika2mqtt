@@ -9,6 +9,7 @@ import requests
 from telemetry import (
     InstallerTelemetry,
     InventoryError,
+    OperatingModeError,
     PvInventory,
     decode_rebus_state,
     decode_system_operating_mode,
@@ -208,6 +209,142 @@ class TelemetryTests(unittest.TestCase):
                 "system_operating_mode_description": None,
             },
         )
+
+    def test_operating_mode_write_uses_dynamic_mod_id_and_confirmed_readback(self):
+        for code, label in (
+            (1, "Grid Tie"),
+            (2, "Self Supply"),
+            (3, "Clean Backup"),
+            (4, "Priority Backup"),
+        ):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                path = "/device/27/model/inverter_status"
+                routes = {
+                    "/devices": {
+                        "inv": [{
+                            "lastheard": 1,
+                            "modID": 27,
+                            "power": 1000,
+                            "rcpn": "INV27",
+                            "type": "inv",
+                        }]
+                    },
+                    path: {"fixed": {"SysMd": 3}},
+                }
+                posts = []
+
+                def post(url, data, timeout):
+                    posts.append((url, data, timeout))
+                    routes[path] = {"fixed": {"SysMd": code}}
+                    return Response(status=204)
+
+                collector = self.collector(directory, routes, request_post=post)
+                collector.poll()
+                snapshot = collector.set_system_operating_mode(code)
+
+                self.assertEqual(
+                    posts,
+                    [(f"http://installer{path}", {"SysMd": str(code)}, 5)],
+                )
+                self.assertEqual(snapshot["inverter"]["system_operating_mode"], label)
+                self.assertEqual(snapshot["inverter"]["system_operating_mode_code"], code)
+
+    def test_operating_mode_write_rejects_unsafe_or_malformed_codes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            posts = []
+            collector = self.collector(
+                directory,
+                {"/devices": {}},
+                request_post=lambda *args, **kwargs: posts.append((args, kwargs)),
+            )
+            for code in (0, 5, 6, 1.0, True, "2", None):
+                with self.subTest(code=code), self.assertRaises(OperatingModeError):
+                    collector.set_system_operating_mode(code)
+            self.assertEqual(posts, [])
+
+    def test_operating_mode_write_requires_inverter_and_matching_readback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            no_inverter = self.collector(directory, {"/devices": {}})
+            no_inverter.poll()
+            with self.assertRaisesRegex(OperatingModeError, "no inverter"):
+                no_inverter.set_system_operating_mode(2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = "/device/9/model/inverter_status"
+            routes = {
+                "/devices": {
+                    "inv": [{
+                        "lastheard": 1,
+                        "modID": 9,
+                        "power": 1000,
+                        "rcpn": "INV9",
+                        "type": "inv",
+                    }]
+                },
+                path: {"fixed": {"SysMd": 3}},
+            }
+            collector = self.collector(
+                directory,
+                routes,
+                request_post=lambda *args, **kwargs: Response(status=200),
+            )
+            before = collector.poll()
+            with self.assertRaisesRegex(OperatingModeError, "expected 2"):
+                collector.set_system_operating_mode(2)
+            self.assertEqual(
+                collector.current_snapshot()["inverter"]["system_operating_mode"],
+                before["inverter"]["system_operating_mode"],
+            )
+
+            routes[path] = {"fixed": {"SysMd": "invalid"}}
+            with self.assertRaisesRegex(OperatingModeError, "numeric SysMd"):
+                collector.set_system_operating_mode(2)
+
+    def test_operating_mode_write_wraps_mocked_transport_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            routes = {
+                "/devices": {
+                    "inv": [{
+                        "lastheard": 1,
+                        "modID": 9,
+                        "power": 1000,
+                        "rcpn": "INV9",
+                        "type": "inv",
+                    }]
+                }
+            }
+            collector = self.collector(
+                directory,
+                routes,
+                request_post=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    requests.exceptions.Timeout("mocked timeout")
+                ),
+            )
+            collector.poll()
+            with self.assertRaisesRegex(OperatingModeError, "mocked timeout"):
+                collector.set_system_operating_mode(2)
+
+    def test_operating_mode_write_rejects_mocked_http_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            routes = {
+                "/devices": {
+                    "inv": [{
+                        "lastheard": 1,
+                        "modID": 9,
+                        "power": 1000,
+                        "rcpn": "INV9",
+                        "type": "inv",
+                    }]
+                }
+            }
+            collector = self.collector(
+                directory,
+                routes,
+                request_post=lambda *args, **kwargs: Response(status=500),
+            )
+            collector.poll()
+            with self.assertRaisesRegex(OperatingModeError, "HTTP 500"):
+                collector.set_system_operating_mode(2)
 
     def test_model_failure_backs_off_without_disconnect(self):
         with tempfile.TemporaryDirectory() as directory:

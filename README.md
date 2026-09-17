@@ -282,6 +282,7 @@ file is preferred. The file takes precedence if both are set.
 | `PV_INVENTORY_FREEZE` | `false` | Prevent newly observed PV Links from being learned |
 | `HA_DISCOVERY_ENABLED` | `true` | Publish Home Assistant MQTT device discovery |
 | `HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant discovery prefix |
+| `OPERATING_MODE_CONTROL_ENABLED` | `false` | Allow the approved operating modes to be selected through MQTT |
 | `WEB_ENABLED` | `false` | Start the authenticated web gateway |
 | `WEB_WRITE_ENABLED` | `false` | Forward methods other than GET/HEAD/OPTIONS |
 | `WEB_LISTEN` | `0.0.0.0` | Gateway address inside the container |
@@ -314,6 +315,12 @@ house/energy/state/battery/000100080701
 house/energy/state/pv/00010003119C
 ```
 
+When operating mode control is explicitly enabled, commands use:
+
+```text
+house/energy/command/system_operating_mode
+```
+
 Availability uses:
 
 ```text
@@ -336,6 +343,45 @@ inverter includes an enabled `System Operating Mode` sensor decoded from
 and model description remain available in the inverter JSON.
 Every scalar supplied by the detailed installer models is also available as a
 disabled-by-default diagnostic entity.
+
+### Optional operating mode control
+
+Operating mode control is disabled by default. To add a separate Home
+Assistant `System Operating Mode Control` selector, set:
+
+```yaml
+environment:
+  OPERATING_MODE_CONTROL_ENABLED: "true"
+```
+
+The selector permits only `Grid Tie`, `Self Supply`, `Clean Backup`, and
+`Priority Backup`. Safety Shutdown, Remote Arbitrage, and Sell remain readable
+but cannot be commanded through pika2mqtt. The existing read-only System
+Operating Mode sensor remains available for dashboards and automations.
+
+Home Assistant sends a non-retained command and pika2mqtt rejects any retained
+command received on the topic. The displayed selection is not changed
+optimistically: pika2mqtt resolves the current inverter model ID, sends the
+request, rereads the inverter status, and publishes the new state only after an
+exact match. Failed or unconfirmed commands are logged and are not retried.
+
+Anyone who can publish to the command topic can request a mode change. Use MQTT
+broker ACLs so only the intended Home Assistant account can publish to
+`house/energy/command/system_operating_mode`; other consumers should receive
+read-only access.
+
+Actual mode changes are intentionally not exercised by the automated tests.
+After enabling the feature, the system owner should manually verify it:
+
+1. Record the current mode and watch `docker logs -f pika2mqtt`.
+2. Select one of the four approved modes in Home Assistant.
+3. Confirm the log reports the command as confirmed and both the selector and
+   read-only sensor show the chosen mode.
+4. Restore the preferred operating mode if the test used a temporary setting.
+
+Do this only when changing the inverter mode is operationally safe. The MQTT
+control flag is independent of `WEB_WRITE_ENABLED`; the installer web gateway
+does not need to be exposed or write-enabled.
 
 Power uses watts, battery charge uses percent, and energy uses kWh. Positive
 grid power means export and positive battery power means discharge; separate
