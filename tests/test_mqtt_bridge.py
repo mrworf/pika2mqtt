@@ -257,6 +257,68 @@ class MqttBridgeTests(unittest.TestCase):
         self.assertIn(("house/energy/availability/inverter", "disconnected"), values)
         self.assertIn(("house/energy/availability/pv/00010003119C", "disconnected"), values)
 
+    def test_model_freshness_controls_only_dependent_entities(self):
+        data = snapshot()
+        pv = data["pv_links"]["00010003119C"]
+        pv["endpoint_health"] = {
+            "common": {"fresh": True},
+            "REbus_status": {"fresh": True},
+            "pvlink_status": {"fresh": False},
+            "pvrss_telemetry": {"fresh": True},
+        }
+        self.bridge.publish_snapshot(data)
+        self.connect()
+
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        self.assertIn(
+            (
+                "house/energy/availability/model/00010003119C/pvlink_status",
+                "unavailable",
+            ),
+            values,
+        )
+        self.assertIn(
+            (
+                "house/energy/availability/model/00010003119C/REbus_status",
+                "available",
+            ),
+            values,
+        )
+
+        child = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic == "homeassistant/device/pika2mqtt_pv_00010003119c/config"
+        )
+        components = child["components"]
+        self.assertEqual(components["disconnected"]["name"], "Communication lost")
+        self.assertEqual(
+            components["disconnected"]["unique_id"],
+            "pika2mqtt_pv_00010003119c_disconnected",
+        )
+        enabled_topics = {item["topic"] for item in components["enabled"]["availability"]}
+        status_topics = {item["topic"] for item in components["status"]["availability"]}
+        fault_topics = {item["topic"] for item in components["fault"]["availability"]}
+        self.assertIn(
+            "house/energy/availability/model/00010003119C/pvlink_status",
+            enabled_topics,
+        )
+        self.assertNotIn(
+            "house/energy/availability/model/00010003119C/REbus_status",
+            enabled_topics,
+        )
+        self.assertIn(
+            "house/energy/availability/model/00010003119C/REbus_status",
+            status_topics,
+        )
+        self.assertTrue(
+            {
+                "house/energy/availability/model/00010003119C/REbus_status",
+                "house/energy/availability/model/00010003119C/pvlink_status",
+                "house/energy/availability/model/00010003119C/pvrss_telemetry",
+            }.issubset(fault_topics)
+        )
+
     def test_home_assistant_birth_and_reconnect_republish(self):
         self.bridge.publish_snapshot(snapshot())
         self.connect()

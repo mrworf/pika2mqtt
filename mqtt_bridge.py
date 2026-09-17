@@ -41,6 +41,7 @@ class MqttBridge:
         self._lock = threading.RLock()
         self._latest: dict[str, Any] | None = None
         self._root_id: str | None = None
+        self._root_serial: str | None = None
         self._discovery_payloads: dict[str, str] = {}
         self.client.will_set(
             self._topic("availability/service"),
@@ -184,6 +185,16 @@ class MqttBridge:
                 "available" if "power_w" in pv else "unavailable",
             )
             self._publish(self._topic(f"state/pv/{serial}"), self._json(pv))
+        devices = [snapshot.get("inverter"), *snapshot.get("batteries", [])]
+        devices.extend(snapshot.get("pv_links", {}).values())
+        for device in devices:
+            if not device:
+                continue
+            for model, health in device.get("endpoint_health", {}).items():
+                self._publish(
+                    self._topic(f"availability/model/{device['serial']}/{model}"),
+                    "available" if health.get("fresh") else "unavailable",
+                )
 
     def _availability(self, include_inverter=True, pv_serial: str | None = None):
         topics = [self._topic("availability/service")]
@@ -206,6 +217,21 @@ class MqttBridge:
             "payload_available": "available",
             "payload_not_available": "unavailable",
         }
+
+    def _model_availability(
+        self,
+        availability: list[dict[str, str]],
+        serial: str,
+        *models: str,
+    ) -> list[dict[str, str]]:
+        return availability + [
+            {
+                "topic": self._topic(f"availability/model/{serial}/{model}"),
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            }
+            for model in models
+        ]
 
     def _component(
         self,
@@ -284,6 +310,7 @@ class MqttBridge:
         inverter = snapshot.get("inverter")
         if self._root_id is None and inverter:
             self._root_id = f"pika2mqtt_{stable_id(inverter['serial'])}"
+            self._root_serial = inverter["serial"]
         if self._root_id is None:
             return
         root = self._root_id
@@ -292,6 +319,16 @@ class MqttBridge:
         system_topic = self._topic("state/system")
         inverter_topic = self._topic("state/inverter")
         grid_topic = self._topic("state/grid")
+        inverter_serial = inverter["serial"] if inverter else self._root_serial
+        rebus_availability = self._model_availability(
+            parent_availability, inverter_serial, "REbus_status"
+        )
+        inverter_status_availability = self._model_availability(
+            parent_availability, inverter_serial, "inverter_status"
+        )
+        expansion_availability = self._model_availability(
+            parent_availability, inverter_serial, "REbus_exp"
+        )
         components = {
             "solar_power": self._sensor(root, "solar_power_w", "Solar power", system_topic, availability=parent_availability + [self._power_availability("solar")], device_class="power", unit_of_measurement="W", state_class="measurement"),
             "learned_strings": self._sensor(root, "learned_string_count", "Learned strings", system_topic, availability=service_availability, entity_category="diagnostic"),
@@ -303,14 +340,14 @@ class MqttBridge:
             "any_string_disconnected": self._binary(root, "any_string_disconnected", "String disconnected", system_topic, availability=service_availability, device_class="problem"),
             "any_string_faulted": self._binary(root, "any_string_faulted", "String fault", system_topic, availability=service_availability, device_class="problem"),
             "inverter_power": self._sensor(root, "power_w", "Inverter power", inverter_topic, availability=parent_availability, object_key="inverter_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
-            "inverter_energy": self._sensor(root, "accumulated_energy_kwh", "Inverter accumulated energy", inverter_topic, availability=parent_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing", entity_category="diagnostic", enabled_by_default=False),
-            "inverter_status": self._sensor(root, "status", "Inverter status", inverter_topic, availability=parent_availability),
-            "system_operating_mode": self._sensor(root, "system_operating_mode", "System Operating Mode", inverter_topic, availability=parent_availability),
-            "grid_power": self._sensor(root, "power_w", "Grid power", grid_topic, availability=parent_availability, object_key="grid_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
-            "grid_import_power": self._sensor(root, "import_power_w", "Grid import power", grid_topic, availability=parent_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
-            "grid_export_power": self._sensor(root, "export_power_w", "Grid export power", grid_topic, availability=parent_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
-            "grid_import_energy": self._sensor(root, "import_energy_kwh", "Grid imported energy", grid_topic, availability=parent_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
-            "grid_export_energy": self._sensor(root, "export_energy_kwh", "Grid exported energy", grid_topic, availability=parent_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
+            "inverter_energy": self._sensor(root, "accumulated_energy_kwh", "Inverter accumulated energy", inverter_topic, availability=rebus_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing", entity_category="diagnostic", enabled_by_default=False),
+            "inverter_status": self._sensor(root, "status", "Inverter status", inverter_topic, availability=rebus_availability),
+            "system_operating_mode": self._sensor(root, "system_operating_mode", "System Operating Mode", inverter_topic, availability=inverter_status_availability),
+            "grid_power": self._sensor(root, "power_w", "Grid power", grid_topic, availability=inverter_status_availability, object_key="grid_power_w", device_class="power", unit_of_measurement="W", state_class="measurement"),
+            "grid_import_power": self._sensor(root, "import_power_w", "Grid import power", grid_topic, availability=inverter_status_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
+            "grid_export_power": self._sensor(root, "export_power_w", "Grid export power", grid_topic, availability=inverter_status_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
+            "grid_import_energy": self._sensor(root, "import_energy_kwh", "Grid imported energy", grid_topic, availability=expansion_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
+            "grid_export_energy": self._sensor(root, "export_energy_kwh", "Grid exported energy", grid_topic, availability=expansion_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
         }
         if self.operating_mode_control_enabled:
             components["system_operating_mode_control"] = self._component(
@@ -319,13 +356,21 @@ class MqttBridge:
                 "System Operating Mode Control",
                 inverter_topic,
                 "{{ value_json.system_operating_mode }}",
-                parent_availability,
+                inverter_status_availability,
                 command_topic=self._topic("command/system_operating_mode"),
                 options=list(SYSTEM_OPERATING_MODE_COMMANDS),
                 optimistic=False,
                 retain=False,
             )
-        components.update(self._raw_components(root, inverter_topic, inverter, parent_availability))
+        components.update(
+            self._raw_components(
+                root,
+                inverter_topic,
+                inverter,
+                parent_availability,
+                inverter_serial,
+            )
+        )
         self._publish_config(
             root,
             self._config(self._device(root, "Generac PWRcell", "PWRcell inverter"), components),
@@ -342,22 +387,37 @@ class MqttBridge:
         topic = self._topic(f"state/battery/{serial}")
         availability = self._availability()
         specs = [
-            ("power_w", "Power", "power", "W", "measurement"),
-            ("input_power_w", "Charging power", "power", "W", "measurement"),
-            ("output_power_w", "Discharging power", "power", "W", "measurement"),
-            ("state_of_charge_percent", "State of charge", "battery", "%", "measurement"),
-            ("state_of_health_percent", "State of health", None, "%", "measurement"),
-            ("rated_capacity_kwh", "Rated capacity", "energy_storage", "kWh", None),
-            ("voltage_v", "Voltage", "voltage", "V", "measurement"),
-            ("current_a", "Current", "current", "A", "measurement"),
-            ("temperature_c", "Temperature", "temperature", "°C", "measurement"),
-            ("status", "Status", None, None, None),
+            ("power_w", "Power", "power", "W", "measurement", None),
+            ("input_power_w", "Charging power", "power", "W", "measurement", None),
+            ("output_power_w", "Discharging power", "power", "W", "measurement", None),
+            ("state_of_charge_percent", "State of charge", "battery", "%", "measurement", None),
+            ("state_of_health_percent", "State of health", None, "%", "measurement", "battery"),
+            ("rated_capacity_kwh", "Rated capacity", "energy_storage", "kWh", None, "battery"),
+            ("voltage_v", "Voltage", "voltage", "V", "measurement", "REbus_status"),
+            ("current_a", "Current", "current", "A", "measurement", "REbus_status"),
+            ("temperature_c", "Temperature", "temperature", "°C", "measurement", "REbus_status"),
+            ("status", "Status", None, None, None, "REbus_status"),
         ]
         components = {
-            key: self._sensor(child, key, name, topic, availability=availability, device_class=device_class, unit_of_measurement=unit, state_class=state_class)
-            for key, name, device_class, unit, state_class in specs
+            key: self._sensor(
+                child,
+                key,
+                name,
+                topic,
+                availability=(
+                    self._model_availability(availability, serial, model)
+                    if model
+                    else availability
+                ),
+                device_class=device_class,
+                unit_of_measurement=unit,
+                state_class=state_class,
+            )
+            for key, name, device_class, unit, state_class, model in specs
         }
-        components.update(self._raw_components(child, topic, battery, availability))
+        components.update(
+            self._raw_components(child, topic, battery, availability, serial)
+        )
         self._publish_config(child, self._config(self._device(child, "PWRcell battery", "PWRcell battery", root), components), force)
 
     def _publish_pv_discovery(self, root: str, serial: str, pv: dict[str, Any], force: bool):
@@ -366,30 +426,48 @@ class MqttBridge:
         connected_availability = self._availability()
         measurement_availability = self._availability(pv_serial=serial)
         power_availability = measurement_availability + [self._power_availability(f"pv/{serial}")]
+        rebus_availability = self._model_availability(
+            measurement_availability, serial, "REbus_status"
+        )
+        pvlink_availability = self._model_availability(
+            measurement_availability, serial, "pvlink_status"
+        )
+        pvrss_availability = self._model_availability(
+            measurement_availability, serial, "pvrss_telemetry"
+        )
+        fault_availability = self._model_availability(
+            measurement_availability,
+            serial,
+            "REbus_status",
+            "pvlink_status",
+            "pvrss_telemetry",
+        )
         components = {
-            "disconnected": self._component("binary_sensor", f"{child}_disconnected", "Disconnected", topic, "{{ 'OFF' if value_json.connected else 'ON' }}", connected_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
-            "fault": self._component("binary_sensor", f"{child}_fault", "Fault", topic, "{{ 'ON' if value_json.fault == true else ('OFF' if value_json.fault == false else 'UNKNOWN') }}", measurement_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
-            "fault_summary": self._sensor(child, "fault_summary", "Fault summary", topic, availability=measurement_availability, entity_category="diagnostic"),
+            "disconnected": self._component("binary_sensor", f"{child}_disconnected", "Communication lost", topic, "{{ 'OFF' if value_json.connected else 'ON' }}", connected_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
+            "fault": self._component("binary_sensor", f"{child}_fault", "Fault", topic, "{{ 'ON' if value_json.fault == true else 'OFF' }}", fault_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
+            "fault_summary": self._sensor(child, "fault_summary", "Fault summary", topic, availability=fault_availability, entity_category="diagnostic"),
             "power": self._sensor(child, "power_w", "Power", topic, availability=power_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
-            "input_voltage": self._sensor(child, "input_voltage_v", "Input voltage", topic, availability=measurement_availability, device_class="voltage", unit_of_measurement="V", state_class="measurement"),
-            "input_current": self._sensor(child, "input_current_a", "Input current", topic, availability=measurement_availability, device_class="current", unit_of_measurement="A", state_class="measurement"),
-            "energy": self._sensor(child, "accumulated_energy_kwh", "Accumulated energy", topic, availability=measurement_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
-            "status": self._sensor(child, "status", "Status", topic, availability=measurement_availability),
-            "enabled": self._binary(child, "enabled", "Enabled", topic, availability=measurement_availability, entity_category="diagnostic"),
+            "input_voltage": self._sensor(child, "input_voltage_v", "Input voltage", topic, availability=pvlink_availability, device_class="voltage", unit_of_measurement="V", state_class="measurement"),
+            "input_current": self._sensor(child, "input_current_a", "Input current", topic, availability=pvlink_availability, device_class="current", unit_of_measurement="A", state_class="measurement"),
+            "energy": self._sensor(child, "accumulated_energy_kwh", "Accumulated energy", topic, availability=rebus_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
+            "status": self._sensor(child, "status", "Status", topic, availability=rebus_availability),
+            "enabled": self._binary(child, "enabled", "Enabled", topic, availability=pvlink_availability, entity_category="diagnostic"),
             "last_heard": self._sensor(child, "last_heard_seconds", "Last heard age", topic, availability=connected_availability, device_class="duration", unit_of_measurement="s", state_class="measurement", entity_category="diagnostic"),
-            "snaprs_installed": self._sensor(child, "snaprs_installed", "SnapRS installed", topic, availability=measurement_availability, entity_category="diagnostic"),
-            "snaprs_detected": self._sensor(child, "snaprs_detected", "SnapRS detected", topic, availability=measurement_availability, entity_category="diagnostic"),
-            "pvrss_self_test": self._sensor(child, "pvrss_self_test", "PVRSS self-test", topic, availability=measurement_availability, entity_category="diagnostic"),
-            "error_word": self._sensor(child, "error_word", "Error word", topic, availability=measurement_availability, entity_category="diagnostic", enabled_by_default=False),
-            "status_code": self._sensor(child, "status_code", "Status code", topic, availability=measurement_availability, entity_category="diagnostic", enabled_by_default=False),
+            "snaprs_installed": self._sensor(child, "snaprs_installed", "SnapRS installed", topic, availability=pvrss_availability, entity_category="diagnostic"),
+            "snaprs_detected": self._sensor(child, "snaprs_detected", "SnapRS detected", topic, availability=pvrss_availability, entity_category="diagnostic"),
+            "pvrss_self_test": self._sensor(child, "pvrss_self_test", "PVRSS self-test", topic, availability=pvrss_availability, entity_category="diagnostic"),
+            "error_word": self._sensor(child, "error_word", "Error word", topic, availability=pvlink_availability, entity_category="diagnostic", enabled_by_default=False),
+            "status_code": self._sensor(child, "status_code", "Status code", topic, availability=rebus_availability, entity_category="diagnostic", enabled_by_default=False),
         }
         # Every scalar returned by the inverter's model endpoints remains
         # available to Home Assistant without making the default device noisy.
         # Normalized entities above are the stable public interface.
-        components.update(self._raw_components(child, topic, pv, measurement_availability))
+        components.update(
+            self._raw_components(child, topic, pv, measurement_availability, serial)
+        )
         self._publish_config(child, self._config(self._device(child, f"PV Link {serial}", "PV Link", root), components), force)
 
-    def _raw_components(self, root, topic, state, availability):
+    def _raw_components(self, root, topic, state, availability, serial=None):
         components = {}
         for model, payload in (state or {}).get("raw_models", {}).items():
             fixed = payload.get("fixed", {}) if isinstance(payload, dict) else {}
@@ -405,7 +483,9 @@ class MqttBridge:
                     f"{model} {field}",
                     topic,
                     "{{ value_json.raw_models[" + json.dumps(model) + "].fixed[" + json.dumps(field) + "] }}",
-                    availability,
+                    self._model_availability(availability, serial, model)
+                    if serial
+                    else availability,
                     entity_category="diagnostic",
                     enabled_by_default=False,
                 )

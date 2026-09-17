@@ -279,6 +279,7 @@ class InstallerTelemetry:
     """Collects installer API data and returns one normalized snapshot."""
 
     MODEL_INTERVAL = 60
+    MODEL_STALE_AFTER = 120
     MAX_MODEL_BACKOFF = 900
 
     def __init__(
@@ -288,6 +289,7 @@ class InstallerTelemetry:
         ignored: list[str] | None = None,
         transport: Any = None,
         detail_interval: int = MODEL_INTERVAL,
+        detail_stale_after: int = MODEL_STALE_AFTER,
         disconnect_after: int = 120,
         clock: Callable[[], float] = time.time,
         request_get: Callable[..., Any] = requests.get,
@@ -298,6 +300,7 @@ class InstallerTelemetry:
         self.ignored = {serial.upper() for serial in (ignored or [])}
         self.transport = transport
         self.detail_interval = detail_interval
+        self.detail_stale_after = detail_stale_after
         self.disconnect_after = disconnect_after
         self.clock = clock
         self.request_get = request_get
@@ -488,24 +491,38 @@ class InstallerTelemetry:
             key = (serial, model)
             if key in self._details:
                 state.setdefault("raw_models", {})[model] = self._details[key]
-            if key in self._endpoint_health:
-                state["endpoint_health"][model] = self._endpoint_health[key]
+            health = dict(self._endpoint_health.get(key, {}))
+            last_success = health.get("last_success")
+            age = max(0.0, now - last_success) if last_success is not None else None
+            health["data_age_seconds"] = age
+            health["fresh"] = bool(
+                age is not None and age <= self.detail_stale_after
+            )
+            state["endpoint_health"][model] = health
         return state
 
+    @staticmethod
+    def _fresh_fixed(state: dict[str, Any], model: str) -> dict[str, Any]:
+        if not state.get("endpoint_health", {}).get(model, {}).get("fresh"):
+            return {}
+        return _fixed(state.get("raw_models", {}).get(model))
+
     def _apply_rebus(self, state: dict[str, Any]) -> None:
-        common = _fixed(state.get("raw_models", {}).get("common"))
-        rebus = _fixed(state.get("raw_models", {}).get("REbus_status"))
-        state.update(decode_rebus_state(rebus.get("St")))
-        state.update({
-            "firmware_version": common.get("Vr"),
-            "rebus_power_w": _number(rebus, "P"),
-            "accumulated_energy_kwh": (_number(rebus, "E") / 1000) if _number(rebus, "E") is not None else None,
-            "voltage_v": _number(rebus, "V"),
-            "current_a": _number(rebus, "I"),
-            "temperature_c": _number(rebus, "T"),
-            "event_code": rebus.get("Ev"),
-            "rebus_bits": rebus.get("RB"),
-        })
+        common = self._fresh_fixed(state, "common")
+        rebus = self._fresh_fixed(state, "REbus_status")
+        if common:
+            state["firmware_version"] = common.get("Vr")
+        if rebus:
+            state.update(decode_rebus_state(rebus.get("St")))
+            state.update({
+                "rebus_power_w": _number(rebus, "P"),
+                "accumulated_energy_kwh": (_number(rebus, "E") / 1000) if _number(rebus, "E") is not None else None,
+                "voltage_v": _number(rebus, "V"),
+                "current_a": _number(rebus, "I"),
+                "temperature_c": _number(rebus, "T"),
+                "event_code": rebus.get("Ev"),
+                "rebus_bits": rebus.get("RB"),
+            })
 
     def _pv_state(self, serial: str, now: float) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
         state = self._base_device(serial, "pv", now)
@@ -523,7 +540,7 @@ class InstallerTelemetry:
         # removing an impossible detailed power value from the public snapshot.
         if "raw_models" in state:
             state["raw_models"] = copy.deepcopy(state["raw_models"])
-        rebus = _fixed(state.get("raw_models", {}).get("REbus_status"))
+        rebus = self._fresh_fixed(state, "REbus_status")
         invalid_rebus_power = source is not None and "P" in rebus and not _valid_pv_power(rebus["P"])
         if invalid_rebus_power:
             issues.append(("REbus_status.P", rebus["P"]))
@@ -531,36 +548,44 @@ class InstallerTelemetry:
         self._apply_rebus(state)
         if invalid_rebus_power:
             state.pop("rebus_power_w", None)
-        pv = _fixed(state.get("raw_models", {}).get("pvlink_status"))
-        pvrss = _fixed(state.get("raw_models", {}).get("pvrss_telemetry"))
+        pv = self._fresh_fixed(state, "pvlink_status")
+        pvrss = self._fresh_fixed(state, "pvrss_telemetry")
         result = pvrss.get("SelfTestResults")
         result_number = int(result) if isinstance(result, (int, float)) else None
-        state.update({
-            "enabled": bool(pv.get("Ena")) if "Ena" in pv else None,
-            "input_voltage_v": _number(pv, "Vin"),
-            "input_current_a": _number(pv, "Iin"),
-            "maximum_current_a": _number(pv, "AMax"),
-            "error_word": int(pv.get("ErrorWord", 0) or 0),
-            "pv_status_word": pv.get("StatusWord"),
-            "pvrss_status": pvrss.get("Status"),
-            "pvrss_self_test": PVRSS_SELF_TEST_RESULTS.get(result_number, result),
-            "snaprs_installed": _number(pvrss, "InstalledCount"),
-            "snaprs_detected": _number(pvrss, "DetectedCount"),
-            "number_of_strings": _number(pvrss, "NumStrings"),
-            "telemetry_updated_at": pvrss.get("LastUpdatedUTCTimestamp"),
-        })
+        if pv:
+            state.update({
+                "enabled": bool(pv.get("Ena")) if "Ena" in pv else None,
+                "input_voltage_v": _number(pv, "Vin"),
+                "input_current_a": _number(pv, "Iin"),
+                "maximum_current_a": _number(pv, "AMax"),
+                "error_word": int(pv.get("ErrorWord", 0) or 0),
+                "pv_status_word": pv.get("StatusWord"),
+            })
+        else:
+            state["error_word"] = 0
+        if pvrss:
+            state.update({
+                "pvrss_status": pvrss.get("Status"),
+                "pvrss_self_test": PVRSS_SELF_TEST_RESULTS.get(result_number, result),
+                "snaprs_installed": _number(pvrss, "InstalledCount"),
+                "snaprs_detected": _number(pvrss, "DetectedCount"),
+                "number_of_strings": _number(pvrss, "NumStrings"),
+                "telemetry_updated_at": pvrss.get("LastUpdatedUTCTimestamp"),
+            })
         state["error_names"] = [
             name for bit, name in enumerate(PV_ERROR_BITS) if state["error_word"] & (1 << bit)
         ]
         fault_reasons = list(state["error_names"])
-        if state["status_severity"] == "error":
+        if state.get("status_severity") == "error":
             fault_reasons.append(state["status"])
         if result_number in PVRSS_FAILURE_RESULTS:
             fault_reasons.append(f"pvrss_{state['pvrss_self_test']}")
         if pvrss.get("LockoutError"):
             fault_reasons.append("pvrss_lockout")
         assessment_models = {"REbus_status", "pvlink_status", "pvrss_telemetry"}
-        assessment_complete = assessment_models.issubset(state.get("raw_models", {}))
+        assessment_complete = all(
+            state["endpoint_health"][model]["fresh"] for model in assessment_models
+        )
         state["fault_reasons"] = sorted(set(fault_reasons))
         state["fault_assessment_complete"] = assessment_complete
         state["fault"] = True if state["fault_reasons"] else (False if assessment_complete else None)
@@ -596,20 +621,26 @@ class InstallerTelemetry:
         self._apply_rebus(state)
         models = state.get("raw_models", {})
         if kind == "inverter":
-            inverter_status = _fixed(models.get("inverter_status"))
-            state.update(decode_system_operating_mode(inverter_status.get("SysMd")))
+            inverter_status = self._fresh_fixed(state, "inverter_status")
+            if inverter_status:
+                state.update(decode_system_operating_mode(inverter_status.get("SysMd")))
         if kind == "battery":
-            battery = _fixed(models.get("battery"))
+            battery = self._fresh_fixed(state, "battery")
             source = self._last_devices.get(serial, {})
-            state.update({
-                "state_of_charge_percent": _number(battery, "SoC") if _number(battery, "SoC") is not None else _number(source, "soc"),
-                "state_of_health_percent": _number(battery, "SoH"),
-                "rated_capacity_kwh": (_number(battery, "WHRtg") / 1000) if _number(battery, "WHRtg") is not None else None,
-                "maximum_charge_power_w": _number(battery, "WChaMax", "MaxChaW"),
-                "maximum_discharge_power_w": _number(battery, "WDisChaMax", "MaxDisChaW"),
-                "minimum_cell_voltage_v": _number(battery, "CellVMin"),
-                "maximum_cell_voltage_v": _number(battery, "CellVMax"),
-            })
+            state["state_of_charge_percent"] = (
+                _number(battery, "SoC")
+                if _number(battery, "SoC") is not None
+                else _number(source, "soc")
+            )
+            if battery:
+                state.update({
+                    "state_of_health_percent": _number(battery, "SoH"),
+                    "rated_capacity_kwh": (_number(battery, "WHRtg") / 1000) if _number(battery, "WHRtg") is not None else None,
+                    "maximum_charge_power_w": _number(battery, "WChaMax", "MaxChaW"),
+                    "maximum_discharge_power_w": _number(battery, "WDisChaMax", "MaxDisChaW"),
+                    "minimum_cell_voltage_v": _number(battery, "CellVMin"),
+                    "maximum_cell_voltage_v": _number(battery, "CellVMax"),
+                })
         return state
 
     def _snapshot(self, now: float) -> dict[str, Any]:
@@ -640,8 +671,8 @@ class InstallerTelemetry:
         grid = None
         if inverter:
             models = inverter.get("raw_models", {})
-            status = _fixed(models.get("inverter_status"))
-            expansion = _fixed(models.get("REbus_exp"))
+            status = self._fresh_fixed(inverter, "inverter_status")
+            expansion = self._fresh_fixed(inverter, "REbus_exp")
             signed_power = _number(status, "CTPow")
             grid = {
                 "power_w": signed_power,

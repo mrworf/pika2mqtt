@@ -358,6 +358,64 @@ class TelemetryTests(unittest.TestCase):
             self.assertFalse(pv["endpoint_health"]["pvlink_status"]["available"])
             self.assertEqual(pv["endpoint_health"]["pvlink_status"]["retry_in_seconds"], 60)
 
+    def test_model_values_expire_after_grace_and_recover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1000]
+            routes = {"/devices": self.fixture("devices.json")}
+            routes["/device/3/model/common"] = {"fixed": {"Vr": "1.2.3"}}
+            routes["/device/3/model/REbus_status"] = self.fixture("rebus_status.json")
+            routes["/device/3/model/pvlink_status"] = self.fixture("pvlink_status.json")
+            routes["/device/3/model/pvrss_telemetry"] = self.fixture("pvrss_telemetry.json")
+            collector = self.collector(
+                directory,
+                routes,
+                detail_interval=60,
+                detail_stale_after=120,
+            )
+            collector.clock = lambda: now[0]
+
+            fresh = collector.poll()["pv_links"]["000100030001"]
+            self.assertTrue(fresh["enabled"])
+            self.assertFalse(fresh["fault"])
+
+            for model in ("REbus_status", "pvlink_status", "pvrss_telemetry"):
+                routes[f"/device/3/model/{model}"] = requests.exceptions.Timeout(
+                    f"mocked {model} timeout"
+                )
+            now[0] = 1060
+            within_grace = collector.poll()["pv_links"]["000100030001"]
+            self.assertTrue(within_grace["enabled"])
+            self.assertFalse(within_grace["fault"])
+            self.assertTrue(
+                within_grace["endpoint_health"]["pvlink_status"]["fresh"]
+            )
+
+            now[0] = 1121
+            stale = collector.poll()["pv_links"]["000100030001"]
+            self.assertTrue(stale["connected"])
+            self.assertNotIn("enabled", stale)
+            self.assertNotIn("status", stale)
+            self.assertIsNone(stale["fault"])
+            self.assertEqual(stale["fault_summary"], "unknown")
+            self.assertIn("pvlink_status", stale["raw_models"])
+            self.assertFalse(stale["endpoint_health"]["pvlink_status"]["fresh"])
+            self.assertEqual(
+                stale["endpoint_health"]["pvlink_status"]["data_age_seconds"],
+                121,
+            )
+
+            routes["/device/3/model/REbus_status"] = self.fixture("rebus_status.json")
+            recovered_pv = self.fixture("pvlink_status.json")
+            recovered_pv["fixed"]["Ena"] = 0
+            routes["/device/3/model/pvlink_status"] = recovered_pv
+            routes["/device/3/model/pvrss_telemetry"] = self.fixture("pvrss_telemetry.json")
+            now[0] = 1241
+            recovered = collector.poll()["pv_links"]["000100030001"]
+            self.assertTrue(recovered["connected"])
+            self.assertFalse(recovered["enabled"])
+            self.assertFalse(recovered["fault"])
+            self.assertTrue(recovered["endpoint_health"]["pvlink_status"]["fresh"])
+
     def test_model_failure_backoff_grows_and_is_capped(self):
         with tempfile.TemporaryDirectory() as directory:
             now = [1000]

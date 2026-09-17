@@ -399,16 +399,22 @@ omitted and unavailable instead of reporting a partial total. The container
 logs one warning when a string enters an invalid-data episode and an
 informational message when valid power resumes.
 
-Each PV Link has independent connectivity and fault signals. Connectivity is
-based on `/devices` presence and `lastheard`; a string becomes disconnected
-after 120 seconds by default. A detailed model returning HTTP 400/500 does not
-by itself disconnect a string. Faults cover REbus error states, PV Link error
-bits, PVRSS lockout, and failed PVRSS self-tests. `LOW_SUN`, disabled, and
-transitional states remain visible status values but do not count as a
-disconnect. If the firmware does not serve the detail models, fault status is
-unknown rather than incorrectly clear; connection and power monitoring still
-continue from `/devices`. The system device provides separate aggregate “any
-string disconnected” and “any string faulted” binary sensors for alerting.
+Each PV Link has independent communication, enabled, and fault signals.
+Communication is based on `/devices` presence and `lastheard`; the
+`Communication lost` entity changes only after 120 seconds by default. A PV
+Link that is disabled but still responding therefore shows Enabled Off and
+Communication lost OK. A detailed model returning HTTP 400/500 does not by
+itself disconnect a string.
+
+Detailed model values have a two-minute freshness window. A brief endpoint
+failure continues to use the last confirmed value, but after that window only
+the affected model-backed entities become unavailable. `/devices` power,
+last-heard age, and communication monitoring remain usable. Cached raw model
+payloads remain in MQTT JSON for diagnosis with `endpoint_health` freshness and
+age metadata, but stale data is not used for normalized values or fault
+decisions. Faults cover REbus error states, PV Link error bits, PVRSS lockout,
+and failed PVRSS self-tests. The system device provides separate aggregate
+“any string disconnected” and “any string faulted” binary sensors for alerting.
 
 The collector follows the endpoint contract used by the installer UI:
 `/devices`; inverter `common`, `REbus_status`, `inverter_status`, `REbus_exp`,
