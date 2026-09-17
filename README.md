@@ -420,8 +420,13 @@ The collector follows the endpoint contract used by the installer UI:
 `/devices`; inverter `common`, `REbus_status`, `inverter_status`, `REbus_exp`,
 and `inverter`; battery `common`, `REbus_status`, and `battery`; and PV Link
 `common`, `REbus_status`, `pvlink_status`, and `pvrss_telemetry`. Detailed model
-errors are logged and retried with per-route exponential backoff capped at 15
-minutes while `/devices` polling continues.
+requests run serially in a separate worker with a persistent HTTP session, so a
+slow or hung model cannot delay `/devices` polling. Requests are spaced rather
+than sent as one synchronized burst. Detailed model errors are logged and
+retried with staggered per-route exponential backoff capped at 15 minutes.
+HTTP 500 responses and read timeouts from an individual model affect only that
+endpoint; they do not recycle a healthy SSH tunnel. Primary `/devices`
+connection failures remain authoritative for tunnel-health recovery.
 
 Set `HA_DISCOVERY_ENABLED=false` to consume the JSON topics without Home
 Assistant discovery, for example through Telegraf or InfluxDB.

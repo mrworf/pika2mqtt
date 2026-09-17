@@ -7,7 +7,9 @@ import json
 import logging
 import math
 import os
+import random
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -294,6 +296,9 @@ class InstallerTelemetry:
         clock: Callable[[], float] = time.time,
         request_get: Callable[..., Any] = requests.get,
         request_post: Callable[..., Any] = requests.post,
+        detail_request_get: Callable[..., Any] | None = None,
+        detail_request_spacing: float = 0.25,
+        retry_jitter: Callable[[float, float], float] = random.uniform,
     ):
         self.base_url = base_url.rstrip("/")
         self.inventory = inventory
@@ -305,6 +310,21 @@ class InstallerTelemetry:
         self.clock = clock
         self.request_get = request_get
         self.request_post = request_post
+        self._detail_session = None
+        if detail_request_get is not None:
+            self.detail_request_get = detail_request_get
+        elif request_get is requests.get:
+            self._detail_session = requests.Session()
+            self.detail_request_get = self._detail_session.get
+        else:
+            self.detail_request_get = request_get
+        self.detail_request_spacing = detail_request_spacing
+        self.retry_jitter = retry_jitter
+        self._lock = threading.RLock()
+        self._detail_request_lock = threading.Lock()
+        self._detail_stop = threading.Event()
+        self._detail_wake = threading.Event()
+        self._detail_thread: threading.Thread | None = None
         self._details: dict[tuple[str, str], dict[str, Any]] = {}
         self._endpoint_health: dict[tuple[str, str], dict[str, Any]] = {}
         self._next_detail: dict[tuple[str, str], float] = {}
@@ -313,11 +333,17 @@ class InstallerTelemetry:
         self._last_devices_success: float | None = None
         self._invalid_pv_power_serials: set[str] = set()
 
-    def _get_json(self, path: str) -> dict[str, Any]:
+    def _get_json(
+        self,
+        path: str,
+        request_get: Callable[..., Any] | None = None,
+        report_transport: bool = True,
+    ) -> dict[str, Any]:
+        getter = request_get or self.request_get
         try:
-            response = self.request_get(self.base_url + path, timeout=5)
+            response = getter(self.base_url + path, timeout=5)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
-            if self.transport:
+            if report_transport and self.transport:
                 self.transport.report_transport_failure(error)
             raise
         if response.status_code != 200:
@@ -325,7 +351,7 @@ class InstallerTelemetry:
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError(f"non-object response for {path}")
-        if self.transport:
+        if report_transport and self.transport:
             self.transport.report_success()
         return payload
 
@@ -348,21 +374,23 @@ class InstallerTelemetry:
             or code not in WRITABLE_SYSTEM_OPERATING_MODE_CODES
         ):
             raise OperatingModeError(f"operating mode code {code!r} is not writable")
-        inverter = next(
-            (
-                (serial, device)
-                for serial, device in self._last_devices.items()
-                if device["kind"] == "inverter" and serial not in self.ignored
-            ),
-            None,
-        )
+        with self._lock:
+            inverter = next(
+                (
+                    (serial, dict(device))
+                    for serial, device in self._last_devices.items()
+                    if device["kind"] == "inverter" and serial not in self.ignored
+                ),
+                None,
+            )
         if inverter is None:
             raise OperatingModeError("no inverter is currently available")
         serial, device = inverter
         path = f"/device/{int(device['modID'])}/model/inverter_status"
         try:
-            self._post_form(path, {"SysMd": str(code)})
-            readback = self._get_json(path)
+            with self._detail_request_lock:
+                self._post_form(path, {"SysMd": str(code)})
+                readback = self._get_json(path)
         except (requests.RequestException, ValueError, TypeError) as error:
             raise OperatingModeError(f"operating mode request failed: {error}") from error
         confirmed = _fixed(readback).get("SysMd")
@@ -375,11 +403,14 @@ class InstallerTelemetry:
 
         now = self.clock()
         key = (serial, "inverter_status")
-        self._details[key] = readback
-        self._failures[key] = 0
-        self._next_detail[key] = now + self.detail_interval
-        self._endpoint_health[key] = {"available": True, "last_success": int(now)}
-        return self._snapshot(now)
+        with self._lock:
+            current = self._last_devices.get(serial)
+            if current is None or int(current["modID"]) != int(device["modID"]):
+                raise OperatingModeError(
+                    "inverter mapping changed before operating mode confirmation"
+                )
+            self._record_detail_success(key, readback, now)
+            return self._snapshot(now)
 
     @staticmethod
     def _kind(group: str, entry: dict[str, Any]) -> str:
@@ -415,9 +446,13 @@ class InstallerTelemetry:
                 item["last_heard_seconds"] = age
                 item["last_seen_at"] = int(now - age)
                 current[normalized] = item
-        self._last_devices = current
-        self._last_devices_success = now
-        self.inventory.observe([serial for serial, item in current.items() if item["kind"] == "pv"])
+        with self._lock:
+            self._last_devices = current
+            self._last_devices_success = now
+            self.inventory.observe(
+                [serial for serial, item in current.items() if item["kind"] == "pv"]
+            )
+        self._detail_wake.set()
         return True
 
     @staticmethod
@@ -430,38 +465,190 @@ class InstallerTelemetry:
             return ("common", "REbus_status", "pvlink_status", "pvrss_telemetry")
         return ()
 
+    def _record_detail_success(
+        self,
+        key: tuple[str, str],
+        payload: dict[str, Any],
+        now: float,
+    ) -> None:
+        failures = self._failures.get(key, 0)
+        self._details[key] = payload
+        self._failures[key] = 0
+        self._next_detail[key] = now + self.detail_interval
+        self._endpoint_health[key] = {"available": True, "last_success": int(now)}
+        if failures:
+            LOG.info("Installer model %s for %s recovered", key[1], key[0])
+
+    def _record_detail_failure(
+        self,
+        key: tuple[str, str],
+        error: BaseException,
+        now: float,
+        stagger: bool,
+    ) -> None:
+        failures = self._failures.get(key, 0) + 1
+        self._failures[key] = failures
+        base_delay = min(
+            self.MAX_MODEL_BACKOFF,
+            self.detail_interval * (2 ** (failures - 1)),
+        )
+        jitter_limit = min(15.0, base_delay * 0.25) if stagger else 0.0
+        jitter = self.retry_jitter(0.0, jitter_limit) if jitter_limit else 0.0
+        delay = min(self.MAX_MODEL_BACKOFF, base_delay + jitter)
+        self._next_detail[key] = now + delay
+        health = self._endpoint_health.setdefault(key, {})
+        health.update(
+            {
+                "available": False,
+                "last_error": str(error),
+                "retry_in_seconds": delay,
+            }
+        )
+        LOG.warning(
+            "Installer model %s for %s unavailable; retrying in %.1fs: %s",
+            key[1],
+            key[0],
+            delay,
+            error,
+        )
+
     def _read_details(self, now: float) -> None:
-        for serial, device in self._last_devices.items():
+        with self._lock:
+            devices = [
+                (serial, dict(device))
+                for serial, device in self._last_devices.items()
+            ]
+        for serial, device in devices:
             if serial in self.ignored:
                 continue
             for model in self._models_for(device["kind"]):
                 key = (serial, model)
-                if now < self._next_detail.get(key, 0):
+                with self._lock:
+                    next_detail = self._next_detail.get(key, 0)
+                if now < next_detail:
                     continue
                 path = f"/device/{int(device['modID'])}/model/{model}"
                 try:
-                    self._details[key] = self._get_json(path)
-                    self._failures[key] = 0
-                    self._next_detail[key] = now + self.detail_interval
-                    self._endpoint_health[key] = {"available": True, "last_success": int(now)}
+                    with self._detail_request_lock:
+                        payload = self._get_json(
+                            path,
+                            request_get=self.detail_request_get,
+                            report_transport=False,
+                        )
                 except (requests.RequestException, ValueError, TypeError) as error:
-                    failures = self._failures.get(key, 0) + 1
-                    self._failures[key] = failures
-                    delay = min(self.MAX_MODEL_BACKOFF, self.detail_interval * (2 ** (failures - 1)))
-                    self._next_detail[key] = now + delay
-                    health = self._endpoint_health.setdefault(key, {})
-                    health.update({"available": False, "last_error": str(error), "retry_in_seconds": delay})
-                    LOG.warning("Installer model %s for %s unavailable; retrying in %ss: %s", model, serial, delay, error)
+                    with self._lock:
+                        self._record_detail_failure(key, error, now, stagger=False)
+                else:
+                    with self._lock:
+                        self._record_detail_success(key, payload, now)
+
+    def _next_detail_task(
+        self, now: float
+    ) -> tuple[tuple[str, int, str] | None, float]:
+        with self._lock:
+            candidates = []
+            for serial, device in self._last_devices.items():
+                if serial in self.ignored:
+                    continue
+                for model in self._models_for(device["kind"]):
+                    due = self._next_detail.get((serial, model), 0.0)
+                    candidates.append(
+                        (due, serial, int(device["modID"]), model)
+                    )
+        if not candidates:
+            return None, 1.0
+        due, serial, mod_id, model = min(candidates)
+        if due > now:
+            return None, min(1.0, due - now)
+        return (serial, mod_id, model), 0.0
+
+    def _run_detail_task(self, task: tuple[str, int, str]) -> None:
+        serial, mod_id, model = task
+        key = (serial, model)
+        path = f"/device/{mod_id}/model/{model}"
+        try:
+            with self._detail_request_lock:
+                payload = self._get_json(
+                    path,
+                    request_get=self.detail_request_get,
+                    report_transport=False,
+                )
+            error = None
+        except (requests.RequestException, ValueError, TypeError) as caught:
+            payload = None
+            error = caught
+        now = self.clock()
+        with self._lock:
+            current = self._last_devices.get(serial)
+            if current is None or int(current["modID"]) != mod_id:
+                LOG.info(
+                    "Discarding installer model %s for stale device mapping %s/%s",
+                    model,
+                    serial,
+                    mod_id,
+                )
+                return
+            if error is not None:
+                self._record_detail_failure(key, error, now, stagger=True)
+            else:
+                self._record_detail_success(key, payload, now)
+
+    def _detail_loop(self) -> None:
+        LOG.info("Starting installer detail collector")
+        while not self._detail_stop.is_set():
+            if self.transport and hasattr(self.transport, "wait_available"):
+                if not self.transport.wait_available(timeout=1):
+                    continue
+            task, wait_for = self._next_detail_task(self.clock())
+            if task is None:
+                self._detail_wake.wait(wait_for)
+                self._detail_wake.clear()
+                continue
+            self._run_detail_task(task)
+            self._detail_stop.wait(self.detail_request_spacing)
+        LOG.info("Installer detail collector stopped")
+
+    def start_detail_worker(self) -> None:
+        if self._detail_thread and self._detail_thread.is_alive():
+            return
+        self._detail_stop.clear()
+        self._detail_thread = threading.Thread(
+            target=self._detail_loop,
+            name="installer-detail-collector",
+            daemon=True,
+        )
+        self._detail_thread.start()
+
+    def stop_detail_worker(self) -> None:
+        self._detail_stop.set()
+        self._detail_wake.set()
+        if (
+            self._detail_thread
+            and self._detail_thread is not threading.current_thread()
+        ):
+            self._detail_thread.join(timeout=10)
+        self._detail_thread = None
+        if self._detail_session is not None:
+            self._detail_session.close()
+
+    def _poll_devices(self, now: float) -> bool:
+        try:
+            return self._read_devices(now)
+        except (requests.RequestException, ValueError, TypeError) as error:
+            LOG.warning("Installer devices endpoint unavailable: %s", error)
+            return False
 
     def poll(self) -> dict[str, Any]:
         now = self.clock()
-        try:
-            devices_ok = self._read_devices(now)
-        except (requests.RequestException, ValueError, TypeError) as error:
-            devices_ok = False
-            LOG.warning("Installer devices endpoint unavailable: %s", error)
+        devices_ok = self._poll_devices(now)
         if devices_ok:
             self._read_details(now)
+        return self._snapshot(now)
+
+    def poll_primary(self) -> dict[str, Any]:
+        """Refresh `/devices` without waiting for detailed model requests."""
+        now = self.clock()
+        self._poll_devices(now)
         return self._snapshot(now)
 
     def current_snapshot(self) -> dict[str, Any]:
@@ -644,6 +831,10 @@ class InstallerTelemetry:
         return state
 
     def _snapshot(self, now: float) -> dict[str, Any]:
+        with self._lock:
+            return self._snapshot_locked(now)
+
+    def _snapshot_locked(self, now: float) -> dict[str, Any]:
         api_connected = bool(
             self._last_devices_success is not None
             and now - self._last_devices_success <= self.disconnect_after

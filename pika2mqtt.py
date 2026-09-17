@@ -89,7 +89,7 @@ class CollectorThread(threading.Thread):
             self._process_pending_operating_mode()
             if time.monotonic() >= next_poll:
                 if self.transport.wait_available(timeout=1):
-                    snapshot = self.telemetry.poll()
+                    snapshot = self.telemetry.poll_primary()
                 else:
                     snapshot = self.telemetry.current_snapshot()
                 self.publisher.publish_snapshot(snapshot)
@@ -261,6 +261,7 @@ def main(argv=None):
         logging.info("Connecting to MQTT broker %s:%d as %s", args.mqtt, args.mqtt_port, client_id)
         client.connect_async(args.mqtt, args.mqtt_port, 60)
         client.loop_start()
+        telemetry.start_detail_worker()
         monitor.start()
         while not stop_event.wait(0.5):
             if tunnel.wait_fatal(0):
@@ -272,6 +273,7 @@ def main(argv=None):
         monitor.stop()
         if monitor.is_alive():
             monitor.join(timeout=10)
+        telemetry.stop_detail_worker()
         publisher.shutdown()
         client.loop_stop()
         gateway.stop()

@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -428,6 +429,128 @@ class TelemetryTests(unittest.TestCase):
                 collector.poll()
                 self.assertEqual(collector._endpoint_health[key]["retry_in_seconds"], delay)
                 now[0] = collector._next_detail[key]
+
+    def test_background_details_do_not_block_primary_polling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            devices = self.fixture("devices.json")
+            primary_calls = []
+            detail_started = threading.Event()
+            release_detail = threading.Event()
+
+            def get(url, timeout):
+                primary_calls.append(url)
+                return Response(devices)
+
+            def detail_get(url, timeout):
+                detail_started.set()
+                if not release_detail.wait(2):
+                    raise AssertionError("test did not release blocked detail request")
+                return Response({"fixed": {}})
+
+            inventory = PvInventory(str(Path(directory, "inventory.json")))
+            collector = InstallerTelemetry(
+                "http://installer",
+                inventory,
+                request_get=get,
+                detail_request_get=detail_get,
+                detail_request_spacing=0,
+            )
+            collector.poll_primary()
+            collector.start_detail_worker()
+            self.assertTrue(detail_started.wait(1))
+
+            collector.poll_primary()
+            collector.poll_primary()
+            self.assertEqual(len(primary_calls), 3)
+
+            release_detail.set()
+            collector.stop_detail_worker()
+            self.assertIsNone(collector._detail_thread)
+
+    def test_detail_failures_do_not_report_tunnel_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            devices = self.fixture("devices.json")
+            routes = {"/devices": devices}
+            transport = mock.Mock()
+            collector = self.collector(
+                directory,
+                routes,
+                transport=transport,
+                detail_request_get=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    requests.exceptions.ReadTimeout("mocked detail timeout")
+                ),
+                retry_jitter=lambda low, high: high,
+            )
+            collector.poll_primary()
+            transport.reset_mock()
+
+            collector._run_detail_task(("000100030001", 3, "pvlink_status"))
+            transport.report_transport_failure.assert_not_called()
+            self.assertEqual(
+                collector._next_detail[("000100030001", "pvlink_status")],
+                1075,
+            )
+
+            routes["/devices"] = requests.exceptions.ConnectionError(
+                "mocked primary failure"
+            )
+            collector.poll_primary()
+            transport.report_transport_failure.assert_called_once()
+
+    def test_detail_result_for_changed_mod_id_is_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            routes = {"/devices": self.fixture("devices.json")}
+            collector = self.collector(directory, routes)
+            collector.poll_primary()
+
+            def changed_mapping(url, timeout):
+                with collector._lock:
+                    collector._last_devices["000100030001"]["modID"] = 30
+                return Response({"fixed": {"Ena": 1}})
+
+            collector.detail_request_get = changed_mapping
+            with self.assertLogs("telemetry", level="INFO"):
+                collector._run_detail_task(("000100030001", 3, "pvlink_status"))
+            self.assertNotIn(
+                ("000100030001", "pvlink_status"),
+                collector._details,
+            )
+
+    def test_detail_reads_and_mode_confirmation_share_request_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = "/device/9/model/inverter_status"
+            routes = {
+                "/devices": {
+                    "inv": [{
+                        "lastheard": 1,
+                        "modID": 9,
+                        "power": 0,
+                        "rcpn": "INV9",
+                        "type": "inv",
+                    }]
+                },
+                path: {"fixed": {"SysMd": 2}},
+            }
+            collector = None
+
+            def detail_get(url, timeout):
+                self.assertTrue(collector._detail_request_lock.locked())
+                return Response({"fixed": {}})
+
+            def post(url, data, timeout):
+                self.assertTrue(collector._detail_request_lock.locked())
+                return Response(status=204)
+
+            collector = self.collector(
+                directory,
+                routes,
+                detail_request_get=detail_get,
+                request_post=post,
+            )
+            collector.poll_primary()
+            collector._run_detail_task(("INV9", 9, "common"))
+            snapshot = collector.set_system_operating_mode(2)
+            self.assertEqual(snapshot["inverter"]["system_operating_mode_code"], 2)
 
     def test_frozen_collector_reports_but_does_not_monitor_unknown_pv(self):
         with tempfile.TemporaryDirectory() as directory:
