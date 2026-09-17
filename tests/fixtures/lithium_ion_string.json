@@ -1,0 +1,13 @@
+{
+  "fixed": {
+    "NMod": 6
+  },
+  "repeating": {
+    "1": {"ModSoC": 100, "ModSoH": 87.5, "ModNCell": 13, "ModCellVMin": 4.038, "ModCellVMax": 4.042, "ModCellVAvg": 4.04, "ModCellTmpMin": 26.7, "ModCellTmpMax": 30.7, "ModCellTmpAvg": 29.1},
+    "2": {"ModSoC": 68, "ModSoH": 100, "ModNCell": 13, "ModCellVMin": 3.9, "ModCellVMax": 3.91, "ModCellVAvg": 3.905, "ModCellTmpMin": 25.1, "ModCellTmpMax": 29.2, "ModCellTmpAvg": 27.3},
+    "3": {"ModSoC": 67, "ModSoH": 99.5, "ModNCell": 13, "ModCellVMin": 3.89, "ModCellVMax": 3.91, "ModCellVAvg": 3.9, "ModCellTmpMin": 25.3, "ModCellTmpMax": 29.4, "ModCellTmpAvg": 27.5},
+    "4": {"ModSoC": 69, "ModSoH": 98.5, "ModNCell": 13, "ModCellVMin": 3.9, "ModCellVMax": 3.92, "ModCellVAvg": 3.91, "ModCellTmpMin": 25.5, "ModCellTmpMax": 29.5, "ModCellTmpAvg": 27.7},
+    "5": {"ModSoC": 68, "ModSoH": 99, "ModNCell": 13, "ModCellVMin": 3.89, "ModCellVMax": 3.91, "ModCellVAvg": 3.9, "ModCellTmpMin": 25.2, "ModCellTmpMax": 29.3, "ModCellTmpAvg": 27.4},
+    "6": {"ModSoC": 67, "ModSoH": 97.5, "ModNCell": 13, "ModCellVMin": 3.88, "ModCellVMax": 3.9, "ModCellVAvg": 3.89, "ModCellTmpMin": 25, "ModCellTmpMax": 29, "ModCellTmpAvg": 27.1}
+  }
+}

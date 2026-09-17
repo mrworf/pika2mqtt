@@ -312,6 +312,7 @@ house/energy/state/system
 house/energy/state/inverter
 house/energy/state/grid
 house/energy/state/battery/000100080701
+house/energy/state/battery/000100080701/module/1
 house/energy/state/pv/00010003119C
 ```
 
@@ -327,6 +328,8 @@ Availability uses:
 house/energy/availability/service
 house/energy/availability/inverter
 house/energy/availability/pv/00010003119C
+house/energy/availability/battery/000100080701/modules
+house/energy/availability/battery/000100080701/module/1
 house/energy/availability/power/solar
 house/energy/availability/power/pv/00010003119C
 ```
@@ -336,13 +339,28 @@ Assistant suppress only a bad power measurement without treating the inverter
 or PV Link as disconnected.
 
 Home Assistant discovery creates one PWRcell inverter/system device, a battery
-child, and one child per learned PV Link. Principal power, battery, energy,
-status, connectivity, SnapRS, and PVRSS measurements are exposed directly. The
+child, a child for each battery module, and one child per learned PV Link.
+Principal power, battery, energy, status, connectivity, SnapRS, and PVRSS
+measurements are exposed directly. The
 inverter includes an enabled `System Operating Mode` sensor decoded from
 `SysMd` (for example, `Clean Backup`), while its stable enum key, numeric code,
 and model description remain available in the inverter JSON.
 Every scalar supplied by the detailed installer models is also available as a
 disabled-by-default diagnostic entity.
+
+Battery module data comes from the inverter's `lithium_ion_string_module`
+model. Each module child exposes state of charge and state of health by
+default. Its physical cell count and minimum, maximum, and average cell voltage
+and temperature are available as disabled-by-default diagnostics. A module is
+a replaceable PWRcell battery module containing multiple physical cells; the
+installer API does not expose SoC or SoH for each physical cell.
+
+The existing aggregate PWRcell battery device and state topic are unchanged.
+Module measurements use separate state and availability topics. If the model
+is stale, all known module children become unavailable and stale measurements
+are not republished. If the model reports an expected module number without a
+corresponding record, that child remains visible but unavailable, making a
+missing module distinguishable from a module that was never discovered.
 
 ### Optional operating mode control
 

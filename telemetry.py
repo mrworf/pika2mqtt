@@ -19,6 +19,7 @@ import requests
 
 LOG = logging.getLogger(__name__)
 PV_POWER_MAX_W = 5000
+MAX_BATTERY_MODULES = 32
 
 
 class InventoryError(ValueError):
@@ -460,10 +461,17 @@ class InstallerTelemetry:
         if kind == "inverter":
             return ("common", "REbus_status", "inverter_status", "REbus_exp", "inverter")
         if kind == "battery":
-            return ("common", "REbus_status", "battery")
+            return ("common", "REbus_status", "battery", "lithium_ion_string")
         if kind == "pv":
             return ("common", "REbus_status", "pvlink_status", "pvrss_telemetry")
         return ()
+
+    @staticmethod
+    def _model_path(mod_id: int, model: str) -> str:
+        path = f"/device/{int(mod_id)}/model/{model}"
+        if model == "lithium_ion_string":
+            path += "/lithium_ion_string_module"
+        return path
 
     def _record_detail_success(
         self,
@@ -527,7 +535,7 @@ class InstallerTelemetry:
                     next_detail = self._next_detail.get(key, 0)
                 if now < next_detail:
                     continue
-                path = f"/device/{int(device['modID'])}/model/{model}"
+                path = self._model_path(device["modID"], model)
                 try:
                     with self._detail_request_lock:
                         payload = self._get_json(
@@ -565,7 +573,7 @@ class InstallerTelemetry:
     def _run_detail_task(self, task: tuple[str, int, str]) -> None:
         serial, mod_id, model = task
         key = (serial, model)
-        path = f"/device/{mod_id}/model/{model}"
+        path = self._model_path(mod_id, model)
         try:
             with self._detail_request_lock:
                 payload = self._get_json(
@@ -830,6 +838,71 @@ class InstallerTelemetry:
                 })
         return state
 
+    @staticmethod
+    def _battery_module_indices(payload: Any) -> set[int]:
+        if not isinstance(payload, dict):
+            return set()
+        indices: set[int] = set()
+        count = _number(_fixed(payload), "NMod")
+        if (
+            isinstance(count, (int, float))
+            and math.isfinite(count)
+            and int(count) == count
+            and 1 <= int(count) <= MAX_BATTERY_MODULES
+        ):
+            indices.update(range(1, int(count) + 1))
+        repeating = payload.get("repeating")
+        if isinstance(repeating, dict):
+            for key in repeating:
+                try:
+                    index = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if str(index) == str(key) and 1 <= index <= MAX_BATTERY_MODULES:
+                    indices.add(index)
+        return indices
+
+    @classmethod
+    def _battery_module_group(cls, battery: dict[str, Any]) -> dict[str, Any]:
+        serial = battery["serial"]
+        health = dict(
+            battery.get("endpoint_health", {}).get("lithium_ion_string", {})
+        )
+        group = {
+            "battery_serial": serial,
+            "endpoint_health": health,
+            "modules": {},
+        }
+        if not health.get("fresh"):
+            return group
+        payload = battery.get("raw_models", {}).get("lithium_ion_string")
+        if not isinstance(payload, dict):
+            return group
+        repeating = payload.get("repeating")
+        repeating = repeating if isinstance(repeating, dict) else {}
+        fields = {
+            "state_of_charge_percent": "ModSoC",
+            "state_of_health_percent": "ModSoH",
+            "cell_count": "ModNCell",
+            "minimum_cell_voltage_v": "ModCellVMin",
+            "maximum_cell_voltage_v": "ModCellVMax",
+            "average_cell_voltage_v": "ModCellVAvg",
+            "minimum_cell_temperature_c": "ModCellTmpMin",
+            "maximum_cell_temperature_c": "ModCellTmpMax",
+            "average_cell_temperature_c": "ModCellTmpAvg",
+        }
+        for index in sorted(cls._battery_module_indices(payload)):
+            raw = repeating.get(str(index))
+            present = isinstance(raw, dict)
+            module = {"index": index, "present": present}
+            if present:
+                for normalized, source in fields.items():
+                    value = _number(raw, source)
+                    if value is not None and math.isfinite(value):
+                        module[normalized] = value
+            group["modules"][str(index)] = module
+        return group
+
     def _snapshot(self, now: float) -> dict[str, Any]:
         with self._lock:
             return self._snapshot_locked(now)
@@ -853,11 +926,18 @@ class InstallerTelemetry:
             for serial, item in self._last_devices.items()
             if item["kind"] == "inverter" and serial not in self.ignored
         ]
-        batteries = [
-            self._generic_state(serial, "battery", now)
-            for serial, item in self._last_devices.items()
-            if item["kind"] == "battery" and serial not in self.ignored
-        ]
+        batteries = []
+        battery_modules = {}
+        for serial, item in self._last_devices.items():
+            if item["kind"] != "battery" or serial in self.ignored:
+                continue
+            battery = self._generic_state(serial, "battery", now)
+            battery_modules[serial] = self._battery_module_group(battery)
+            battery.get("raw_models", {}).pop("lithium_ion_string", None)
+            battery.get("endpoint_health", {}).pop("lithium_ion_string", None)
+            if not battery.get("raw_models"):
+                battery.pop("raw_models", None)
+            batteries.append(battery)
         inverter = inverters[0] if inverters else None
         grid = None
         if inverter:
@@ -916,6 +996,7 @@ class InstallerTelemetry:
             "inverter": inverter,
             "grid": grid,
             "batteries": batteries,
+            "battery_modules": battery_modules,
             "pv_links": pvs,
             "untracked_pv_links": untracked,
         }

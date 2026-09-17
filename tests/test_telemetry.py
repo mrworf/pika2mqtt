@@ -91,6 +91,11 @@ class TelemetryTests(unittest.TestCase):
             routes["/device/9/model/REbus_exp"] = self.fixture("rebus_exp.json")
             routes["/device/9/model/inverter"] = {"fixed": {"WH": 85411119, "W": 3830}}
             routes["/device/10/model/battery"] = self.fixture("battery.json")
+            module_path = (
+                "/device/10/model/lithium_ion_string/"
+                "lithium_ion_string_module"
+            )
+            routes[module_path] = self.fixture("lithium_ion_string.json")
 
             snapshot = self.collector(directory, routes).poll()
 
@@ -102,6 +107,27 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(snapshot["grid"]["import_energy_kwh"], 2102.074)
             self.assertEqual(snapshot["grid"]["export_energy_kwh"], 41917.264)
             self.assertEqual(snapshot["batteries"][0]["state_of_charge_percent"], 29.9)
+            battery = snapshot["batteries"][0]
+            self.assertNotIn("lithium_ion_string", battery["raw_models"])
+            self.assertNotIn("lithium_ion_string", battery["endpoint_health"])
+            modules = snapshot["battery_modules"]["000100080001"]["modules"]
+            self.assertEqual(len(modules), 6)
+            self.assertEqual(
+                modules["1"],
+                {
+                    "index": 1,
+                    "present": True,
+                    "state_of_charge_percent": 100,
+                    "state_of_health_percent": 87.5,
+                    "cell_count": 13,
+                    "minimum_cell_voltage_v": 4.038,
+                    "maximum_cell_voltage_v": 4.042,
+                    "average_cell_voltage_v": 4.04,
+                    "minimum_cell_temperature_c": 26.7,
+                    "maximum_cell_temperature_c": 30.7,
+                    "average_cell_temperature_c": 29.1,
+                },
+            )
             self.assertEqual(snapshot["system"]["solar_power_w"], 312)
             inverter = snapshot["inverter"]
             self.assertEqual(inverter["system_operating_mode"], "Clean Backup")
@@ -111,6 +137,98 @@ class TelemetryTests(unittest.TestCase):
                 inverter["system_operating_mode_description"],
                 "Charge batteries from solar only before supporting local loads and exporting to utility grid.",
             )
+
+    def test_battery_module_inventory_marks_missing_expected_module_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            devices = self.fixture("devices.json")
+            payload = self.fixture("lithium_ion_string.json")
+            payload["fixed"]["NMod"] = 3
+            payload["repeating"] = {
+                "1": payload["repeating"]["1"],
+                "3": payload["repeating"]["3"],
+            }
+            routes = {
+                "/devices": devices,
+                "/device/10/model/lithium_ion_string/lithium_ion_string_module": payload,
+            }
+
+            group = self.collector(directory, routes).poll()["battery_modules"]["000100080001"]
+
+            self.assertTrue(group["endpoint_health"]["fresh"])
+            self.assertEqual(set(group["modules"]), {"1", "2", "3"})
+            self.assertEqual(group["modules"]["2"], {"index": 2, "present": False})
+
+    def test_battery_module_inventory_ignores_invalid_and_oversized_indices(self):
+        payload = {
+            "fixed": {"NMod": 100},
+            "repeating": {
+                "0": {},
+                "-1": {},
+                "1": {"ModSoC": 50},
+                "01": {"ModSoC": 51},
+                "33": {},
+                "not-a-number": {},
+            },
+        }
+        self.assertEqual(
+            InstallerTelemetry._battery_module_indices(payload),
+            {1},
+        )
+        self.assertEqual(
+            InstallerTelemetry._battery_module_indices(
+                {"fixed": {"NMod": "six"}, "repeating": []}
+            ),
+            set(),
+        )
+
+    def test_battery_module_values_expire_after_grace_and_recover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1000]
+            path = "/device/10/model/lithium_ion_string/lithium_ion_string_module"
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                path: self.fixture("lithium_ion_string.json"),
+            }
+            collector = self.collector(
+                directory,
+                routes,
+                detail_interval=60,
+                detail_stale_after=120,
+            )
+            collector.clock = lambda: now[0]
+
+            fresh = collector.poll()
+            aggregate_soc = fresh["batteries"][0]["state_of_charge_percent"]
+            self.assertEqual(
+                fresh["battery_modules"]["000100080001"]["modules"]["1"][
+                    "state_of_charge_percent"
+                ],
+                100,
+            )
+
+            routes[path] = requests.exceptions.Timeout("mocked module timeout")
+            now[0] = 1060
+            within_grace = collector.poll()
+            self.assertTrue(
+                within_grace["battery_modules"]["000100080001"][
+                    "endpoint_health"
+                ]["fresh"]
+            )
+
+            now[0] = 1121
+            stale = collector.poll()
+            group = stale["battery_modules"]["000100080001"]
+            self.assertFalse(group["endpoint_health"]["fresh"])
+            self.assertEqual(group["modules"], {})
+            self.assertEqual(
+                stale["batteries"][0]["state_of_charge_percent"], aggregate_soc
+            )
+
+            routes[path] = self.fixture("lithium_ion_string.json")
+            now[0] = 1241
+            recovered = collector.poll()["battery_modules"]["000100080001"]
+            self.assertTrue(recovered["endpoint_health"]["fresh"])
+            self.assertEqual(len(recovered["modules"]), 6)
 
     def test_pv_power_accepts_zero_and_five_kw_boundaries(self):
         for power in (0, 312, 5000):

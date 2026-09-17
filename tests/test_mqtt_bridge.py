@@ -1,3 +1,4 @@
+import copy
 import json
 import types
 import unittest
@@ -47,6 +48,33 @@ def snapshot():
         "batteries": [{"serial": "000100080701", "power_w": -100, "input_power_w": 100, "output_power_w": 0, "state_of_charge_percent": 90.5, "status": "charging_battery"}],
         "pv_links": {"00010003119C": {"serial": "00010003119C", "connected": True, "fault": False, "power_w": 1200, "status": "making_power", "last_heard_seconds": 2}},
     }
+
+
+def snapshot_with_battery_modules():
+    data = snapshot()
+    data["battery_modules"] = {
+        "000100080701": {
+            "battery_serial": "000100080701",
+            "endpoint_health": {"fresh": True},
+            "modules": {
+                "1": {
+                    "index": 1,
+                    "present": True,
+                    "state_of_charge_percent": 68,
+                    "state_of_health_percent": 99.5,
+                    "cell_count": 13,
+                    "minimum_cell_voltage_v": 3.89,
+                    "maximum_cell_voltage_v": 3.91,
+                    "average_cell_voltage_v": 3.9,
+                    "minimum_cell_temperature_c": 25.3,
+                    "maximum_cell_temperature_c": 29.4,
+                    "average_cell_temperature_c": 27.5,
+                },
+                "2": {"index": 2, "present": False},
+            },
+        }
+    }
+    return data
 
 
 class MqttBridgeTests(unittest.TestCase):
@@ -146,6 +174,134 @@ class MqttBridgeTests(unittest.TestCase):
         self.assertEqual(child["device"]["via_device"], "pika2mqtt_0001000706fa")
         self.assertIn("disconnected", child["components"])
         self.assertIn("fault", child["components"])
+
+    def test_battery_modules_publish_child_state_availability_and_discovery(self):
+        self.bridge.publish_snapshot(snapshot_with_battery_modules())
+        self.connect()
+
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        self.assertIn(
+            (
+                "house/energy/availability/battery/000100080701/modules",
+                "available",
+            ),
+            values,
+        )
+        self.assertIn(
+            (
+                "house/energy/availability/battery/000100080701/module/1",
+                "available",
+            ),
+            values,
+        )
+        self.assertIn(
+            (
+                "house/energy/availability/battery/000100080701/module/2",
+                "unavailable",
+            ),
+            values,
+        )
+        module_state = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic == "house/energy/state/battery/000100080701/module/1"
+        )
+        self.assertEqual(module_state["state_of_charge_percent"], 68)
+
+        config = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic
+            == "homeassistant/device/pika2mqtt_battery_000100080701_module_1/config"
+        )
+        self.assertEqual(
+            config["device"]["via_device"],
+            "pika2mqtt_battery_000100080701",
+        )
+        self.assertEqual(config["device"]["name"], "PWRcell Battery Module 1")
+        soc = config["components"]["state_of_charge_percent"]
+        self.assertNotIn("enabled_by_default", soc)
+        self.assertEqual(soc["device_class"], "battery")
+        self.assertEqual(
+            {entry["topic"] for entry in soc["availability"]},
+            {
+                "house/energy/availability/service",
+                "house/energy/availability/inverter",
+                "house/energy/availability/battery/000100080701/modules",
+                "house/energy/availability/battery/000100080701/module/1",
+            },
+        )
+        diagnostic = config["components"]["average_cell_voltage_v"]
+        self.assertFalse(diagnostic["enabled_by_default"])
+        self.assertEqual(diagnostic["entity_category"], "diagnostic")
+
+        missing_config = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic
+            == "homeassistant/device/pika2mqtt_battery_000100080701_module_2/config"
+        )
+        self.assertEqual(
+            missing_config["device"]["via_device"],
+            "pika2mqtt_battery_000100080701",
+        )
+
+    def test_stale_battery_module_model_unavailable_without_stale_state(self):
+        data = snapshot_with_battery_modules()
+        self.bridge.publish_snapshot(data)
+        self.connect()
+        self.client.published.clear()
+
+        stale = copy.deepcopy(data)
+        stale["battery_modules"]["000100080701"]["endpoint_health"]["fresh"] = False
+        stale["battery_modules"]["000100080701"]["modules"] = {}
+        self.bridge.publish_snapshot(stale)
+
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        self.assertIn(
+            (
+                "house/energy/availability/battery/000100080701/modules",
+                "unavailable",
+            ),
+            values,
+        )
+        self.assertIn(
+            (
+                "house/energy/availability/battery/000100080701/module/1",
+                "unavailable",
+            ),
+            values,
+        )
+        self.assertFalse(
+            any(
+                topic == "house/energy/state/battery/000100080701/module/1"
+                for topic, _, _, _ in self.client.published
+            )
+        )
+
+    def test_battery_module_data_does_not_change_aggregate_battery_contract(self):
+        def aggregate_publications(data):
+            client = FakeClient()
+            bridge = MqttBridge(client, "house/energy", "inverter.local")
+            bridge.publish_snapshot(data)
+            bridge.on_connect(client, None, None, 0)
+            state = next(
+                payload
+                for topic, payload, _, _ in client.published
+                if topic == "house/energy/state/battery/000100080701"
+            )
+            config = next(
+                payload
+                for topic, payload, _, _ in client.published
+                if topic
+                == "homeassistant/device/pika2mqtt_battery_000100080701/config"
+            )
+            return state, config
+
+        self.assertEqual(
+            aggregate_publications(snapshot()),
+            aggregate_publications(snapshot_with_battery_modules()),
+        )
 
     def test_operating_mode_control_is_absent_and_unsubscribed_by_default(self):
         self.bridge.publish_snapshot(snapshot())

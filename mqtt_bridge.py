@@ -43,6 +43,7 @@ class MqttBridge:
         self._root_id: str | None = None
         self._root_serial: str | None = None
         self._discovery_payloads: dict[str, str] = {}
+        self._known_battery_modules: dict[str, set[int]] = {}
         self.client.will_set(
             self._topic("availability/service"),
             "disconnected",
@@ -175,6 +176,40 @@ class MqttBridge:
             self._publish(
                 self._topic(f"state/battery/{battery['serial']}"), self._json(battery)
             )
+        for serial, group in snapshot.get("battery_modules", {}).items():
+            model_fresh = bool(group.get("endpoint_health", {}).get("fresh"))
+            self._publish(
+                self._topic(f"availability/battery/{serial}/modules"),
+                "available" if model_fresh else "unavailable",
+            )
+            modules = group.get("modules", {})
+            modules = modules if isinstance(modules, dict) else {}
+            known = self._known_battery_modules.setdefault(serial, set())
+            for key in modules:
+                try:
+                    index = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if index > 0:
+                    known.add(index)
+            for index in sorted(known):
+                module = modules.get(str(index))
+                present = bool(
+                    model_fresh
+                    and isinstance(module, dict)
+                    and module.get("present")
+                )
+                self._publish(
+                    self._topic(
+                        f"availability/battery/{serial}/module/{index}"
+                    ),
+                    "available" if present else "unavailable",
+                )
+                if model_fresh and isinstance(module, dict):
+                    self._publish(
+                        self._topic(f"state/battery/{serial}/module/{index}"),
+                        self._json(module),
+                    )
         for serial, pv in snapshot.get("pv_links", {}).items():
             self._publish(
                 self._topic(f"availability/pv/{serial}"),
@@ -378,6 +413,19 @@ class MqttBridge:
         )
         for battery in snapshot.get("batteries", []):
             self._publish_battery_discovery(root, battery, force)
+        for serial, group in snapshot.get("battery_modules", {}).items():
+            modules = group.get("modules", {})
+            if not isinstance(modules, dict):
+                continue
+            for key, module in modules.items():
+                try:
+                    index = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if index > 0 and isinstance(module, dict):
+                    self._publish_battery_module_discovery(
+                        serial, index, force
+                    )
         for serial, pv in snapshot.get("pv_links", {}).items():
             self._publish_pv_discovery(root, serial, pv, force)
 
@@ -419,6 +467,83 @@ class MqttBridge:
             self._raw_components(child, topic, battery, availability, serial)
         )
         self._publish_config(child, self._config(self._device(child, "PWRcell battery", "PWRcell battery", root), components), force)
+
+    def _publish_battery_module_discovery(
+        self, serial: str, index: int, force: bool
+    ) -> None:
+        battery = f"pika2mqtt_battery_{stable_id(serial)}"
+        child = f"{battery}_module_{index}"
+        topic = self._topic(f"state/battery/{serial}/module/{index}")
+        availability = self._availability() + [
+            {
+                "topic": self._topic(
+                    f"availability/battery/{serial}/modules"
+                ),
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            },
+            {
+                "topic": self._topic(
+                    f"availability/battery/{serial}/module/{index}"
+                ),
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            },
+        ]
+        specs = [
+            ("state_of_charge_percent", "State of charge", "battery", "%"),
+            ("state_of_health_percent", "State of health", None, "%"),
+        ]
+        components = {
+            key: self._sensor(
+                child,
+                key,
+                name,
+                topic,
+                availability=availability,
+                device_class=device_class,
+                unit_of_measurement=unit,
+                state_class="measurement",
+            )
+            for key, name, device_class, unit in specs
+        }
+        diagnostics = [
+            ("cell_count", "Cell count", None, None),
+            ("minimum_cell_voltage_v", "Minimum cell voltage", "voltage", "V"),
+            ("maximum_cell_voltage_v", "Maximum cell voltage", "voltage", "V"),
+            ("average_cell_voltage_v", "Average cell voltage", "voltage", "V"),
+            ("minimum_cell_temperature_c", "Minimum cell temperature", "temperature", "°C"),
+            ("maximum_cell_temperature_c", "Maximum cell temperature", "temperature", "°C"),
+            ("average_cell_temperature_c", "Average cell temperature", "temperature", "°C"),
+        ]
+        components.update({
+            key: self._sensor(
+                child,
+                key,
+                name,
+                topic,
+                availability=availability,
+                device_class=device_class,
+                unit_of_measurement=unit,
+                state_class="measurement",
+                entity_category="diagnostic",
+                enabled_by_default=False,
+            )
+            for key, name, device_class, unit in diagnostics
+        })
+        self._publish_config(
+            child,
+            self._config(
+                self._device(
+                    child,
+                    f"PWRcell Battery Module {index}",
+                    "PWRcell battery module",
+                    battery,
+                ),
+                components,
+            ),
+            force,
+        )
 
     def _publish_pv_discovery(self, root: str, serial: str, pv: dict[str, Any], force: bool):
         child = f"pika2mqtt_pv_{stable_id(serial)}"
