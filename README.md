@@ -379,18 +379,18 @@ Operating Mode sensor remains available for dashboards and automations.
 
 Home Assistant sends a non-retained command and pika2mqtt rejects any retained
 command received on the topic. The displayed selection is not changed
-optimistically. pika2mqtt sends one `SysMd` form POST to the writable system
-controller model at `/device/1/model/REbus_dir`; it never writes the read-only
-`inverter_status` model. It reads the controller and inverter status
-immediately, then every five seconds for up to 30 seconds, and publishes the
-new state only after both independently report the requested mode. Failed or
-unconfirmed commands are logged and the write is not retried.
+optimistically. pika2mqtt sends one `0_SysMd` fixed-block form POST to the
+writable system controller model at `/device/1/model/REbus_dir`; it never
+writes the read-only `inverter_status` model. It reads the controller and
+inverter status immediately, then every five seconds for up to 30 seconds, and
+publishes the new state only after both independently report the requested
+mode. Failed or unconfirmed commands are logged and the write is not retried.
 
-Images older than the authoritative `REbus_dir` write repair incorrectly sent
-the request to `inverter_status`. Such a selection could appear successful
-briefly and then revert to the real controller mode. Do not use operating-mode
-automation with an affected image; pull and recreate the container with the
-corrected image first.
+Older images either sent the request to read-only `inverter_status` or omitted
+the installer API's required `0_` fixed-block field prefix. A selection could
+therefore appear successful briefly or be silently ignored. Do not use
+operating-mode automation with an affected image; pull and recreate the
+container with the corrected image first.
 
 Anyone who can publish to the command topic can request a mode change. Use MQTT
 broker ACLs so only the intended Home Assistant account can publish to

@@ -18,7 +18,7 @@ automated mode change is allowed during implementation or validation.
 
 ## Shared acceptance criteria
 
-- A command sends one `SysMd` form POST only to
+- A command sends one `0_SysMd` fixed-block form POST only to
   `/device/1/model/REbus_dir`.
 - Confirmation reads occur immediately and then every five seconds for no more
   than 30 seconds, ending only when `REbus_dir` and `inverter_status` agree

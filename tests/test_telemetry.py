@@ -383,7 +383,7 @@ class TelemetryTests(unittest.TestCase):
                     [
                         (
                             f"http://installer{controller_path}",
-                            {"SysMd": str(code)},
+                            {"0_SysMd": str(code)},
                             5,
                         )
                     ],

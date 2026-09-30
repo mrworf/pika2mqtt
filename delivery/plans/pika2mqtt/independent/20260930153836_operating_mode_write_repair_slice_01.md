@@ -27,7 +27,7 @@ and inverter status telemetry confirm it.
 The MQTT callback continues to validate an exact option label and queues its
 numeric code without blocking MQTT. The collector calls the telemetry write
 path. That path requires a current inverter and a current `lcm` entry with
-`modID` 1, posts `SysMd=<code>` once to the controller route, and serializes
+`modID` 1, posts `0_SysMd=<code>` once to the controller route, and serializes
 confirmation reads with the detail collector.
 
 Each confirmation attempt reads the controller model and inverter status. Both

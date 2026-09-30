@@ -446,7 +446,7 @@ class InstallerTelemetry:
         confirmed_status = None
         try:
             with self._detail_request_lock:
-                self._post_form(controller_path, {"SysMd": str(code)})
+                self._post_form(controller_path, {"0_SysMd": str(code)})
                 for attempt in range(attempts):
                     try:
                         controller_readback = self._get_json(controller_path)
