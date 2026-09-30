@@ -379,9 +379,18 @@ Operating Mode sensor remains available for dashboards and automations.
 
 Home Assistant sends a non-retained command and pika2mqtt rejects any retained
 command received on the topic. The displayed selection is not changed
-optimistically: pika2mqtt resolves the current inverter model ID, sends the
-request, rereads the inverter status, and publishes the new state only after an
-exact match. Failed or unconfirmed commands are logged and are not retried.
+optimistically. pika2mqtt sends one `SysMd` form POST to the writable system
+controller model at `/device/1/model/REbus_dir`; it never writes the read-only
+`inverter_status` model. It reads the controller and inverter status
+immediately, then every five seconds for up to 30 seconds, and publishes the
+new state only after both independently report the requested mode. Failed or
+unconfirmed commands are logged and the write is not retried.
+
+Images older than the authoritative `REbus_dir` write repair incorrectly sent
+the request to `inverter_status`. Such a selection could appear successful
+briefly and then revert to the real controller mode. Do not use operating-mode
+automation with an affected image; pull and recreate the container with the
+corrected image first.
 
 Anyone who can publish to the command topic can request a mode change. Use MQTT
 broker ACLs so only the intended Home Assistant account can publish to
@@ -395,7 +404,9 @@ After enabling the feature, the system owner should manually verify it:
 2. Select one of the four approved modes in Home Assistant.
 3. Confirm the log reports the command as confirmed and both the selector and
    read-only sensor show the chosen mode.
-4. Restore the preferred operating mode if the test used a temporary setting.
+4. Confirm the installer interface and inverter display agree, then observe the
+   selection for at least ten minutes and several telemetry refreshes.
+5. Restore the preferred operating mode if the test used a temporary setting.
 
 Do this only when changing the inverter mode is operationally safe. The MQTT
 control flag is independent of `WEB_WRITE_ENABLED`; the installer web gateway

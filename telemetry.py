@@ -300,6 +300,9 @@ class InstallerTelemetry:
         detail_request_get: Callable[..., Any] | None = None,
         detail_request_spacing: float = 0.25,
         retry_jitter: Callable[[float, float], float] = random.uniform,
+        operating_mode_confirmation_interval: float = 5.0,
+        operating_mode_confirmation_timeout: float = 30.0,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.base_url = base_url.rstrip("/")
         self.inventory = inventory
@@ -321,6 +324,13 @@ class InstallerTelemetry:
             self.detail_request_get = request_get
         self.detail_request_spacing = detail_request_spacing
         self.retry_jitter = retry_jitter
+        if operating_mode_confirmation_interval <= 0:
+            raise ValueError("operating mode confirmation interval must be positive")
+        if operating_mode_confirmation_timeout < 0:
+            raise ValueError("operating mode confirmation timeout cannot be negative")
+        self.operating_mode_confirmation_interval = operating_mode_confirmation_interval
+        self.operating_mode_confirmation_timeout = operating_mode_confirmation_timeout
+        self.sleeper = sleeper
         self._lock = threading.RLock()
         self._detail_request_lock = threading.Lock()
         self._detail_stop = threading.Event()
@@ -368,6 +378,50 @@ class InstallerTelemetry:
         if self.transport:
             self.transport.report_success()
 
+    @staticmethod
+    def _operating_mode_code(payload: Any) -> int | None:
+        value = _fixed(payload).get("SysMd")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and int(value) == value
+        ):
+            return int(value)
+        return None
+
+    @staticmethod
+    def _device_mod_id(device: dict[str, Any]) -> int | None:
+        try:
+            value = device["modID"]
+            if isinstance(value, bool):
+                return None
+            return int(value)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _operating_mode_devices(
+        self,
+    ) -> tuple[tuple[str, dict[str, Any]], tuple[str, dict[str, Any]]]:
+        with self._lock:
+            controllers = [
+                (serial, dict(device))
+                for serial, device in self._last_devices.items()
+                if device["kind"] == "lcm" and self._device_mod_id(device) == 1
+            ]
+            inverters = [
+                (serial, dict(device))
+                for serial, device in self._last_devices.items()
+                if device["kind"] == "inverter" and serial not in self.ignored
+            ]
+        if len(controllers) != 1:
+            raise OperatingModeError(
+                "exactly one LCM system controller at device ID 1 is required"
+            )
+        if len(inverters) != 1:
+            raise OperatingModeError("exactly one inverter is required")
+        return controllers[0], inverters[0]
+
     def set_system_operating_mode(self, code: int) -> dict[str, Any]:
         if (
             not isinstance(code, int)
@@ -375,42 +429,70 @@ class InstallerTelemetry:
             or code not in WRITABLE_SYSTEM_OPERATING_MODE_CODES
         ):
             raise OperatingModeError(f"operating mode code {code!r} is not writable")
-        with self._lock:
-            inverter = next(
-                (
-                    (serial, dict(device))
-                    for serial, device in self._last_devices.items()
-                    if device["kind"] == "inverter" and serial not in self.ignored
-                ),
-                None,
-            )
-        if inverter is None:
-            raise OperatingModeError("no inverter is currently available")
-        serial, device = inverter
-        path = f"/device/{int(device['modID'])}/model/inverter_status"
+        controller, inverter = self._operating_mode_devices()
+        controller_serial, controller_device = controller
+        inverter_serial, inverter_device = inverter
+        inverter_mod_id = self._device_mod_id(inverter_device)
+        if inverter_mod_id is None:
+            raise OperatingModeError("inverter has an invalid device ID")
+        controller_path = "/device/1/model/REbus_dir"
+        status_path = f"/device/{inverter_mod_id}/model/inverter_status"
+        attempts = int(
+            self.operating_mode_confirmation_timeout
+            // self.operating_mode_confirmation_interval
+        ) + 1
+        controller_value: int | str | None = None
+        status_value: int | str | None = None
+        confirmed_status = None
         try:
             with self._detail_request_lock:
-                self._post_form(path, {"SysMd": str(code)})
-                readback = self._get_json(path)
+                self._post_form(controller_path, {"SysMd": str(code)})
+                for attempt in range(attempts):
+                    try:
+                        controller_readback = self._get_json(controller_path)
+                        controller_value = self._operating_mode_code(controller_readback)
+                        if controller_value is None:
+                            controller_value = "invalid"
+                    except (requests.RequestException, ValueError, TypeError) as error:
+                        controller_value = f"error: {error}"
+                    try:
+                        status_readback = self._get_json(status_path)
+                        status_value = self._operating_mode_code(status_readback)
+                        if status_value is None:
+                            status_value = "invalid"
+                    except (requests.RequestException, ValueError, TypeError) as error:
+                        status_value = f"error: {error}"
+                        status_readback = None
+                    if controller_value == code and status_value == code:
+                        confirmed_status = status_readback
+                        break
+                    if attempt + 1 < attempts:
+                        self.sleeper(self.operating_mode_confirmation_interval)
         except (requests.RequestException, ValueError, TypeError) as error:
             raise OperatingModeError(f"operating mode request failed: {error}") from error
-        confirmed = _fixed(readback).get("SysMd")
-        if isinstance(confirmed, bool) or not isinstance(confirmed, (int, float)):
-            raise OperatingModeError("operating mode readback did not contain a numeric SysMd")
-        if confirmed != code:
+        if confirmed_status is None:
             raise OperatingModeError(
-                f"operating mode readback was {confirmed!r}, expected {code}"
+                "operating mode was not confirmed within "
+                f"{self.operating_mode_confirmation_timeout:g} seconds "
+                f"(requested={code}, controller={controller_value!r}, "
+                f"inverter={status_value!r})"
             )
 
         now = self.clock()
-        key = (serial, "inverter_status")
+        key = (inverter_serial, "inverter_status")
         with self._lock:
-            current = self._last_devices.get(serial)
-            if current is None or int(current["modID"]) != int(device["modID"]):
+            current_controller = self._last_devices.get(controller_serial)
+            current_inverter = self._last_devices.get(inverter_serial)
+            if (
+                current_controller is None
+                or self._device_mod_id(current_controller) != 1
+                or current_inverter is None
+                or self._device_mod_id(current_inverter) != inverter_mod_id
+            ):
                 raise OperatingModeError(
-                    "inverter mapping changed before operating mode confirmation"
+                    "device mapping changed before operating mode confirmation"
                 )
-            self._record_detail_success(key, readback, now)
+            self._record_detail_success(key, confirmed_status, now)
             return self._snapshot(now)
 
     @staticmethod

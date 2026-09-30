@@ -59,6 +59,8 @@ class TelemetryTests(unittest.TestCase):
         def get(url, timeout):
             path = url.removeprefix("http://installer")
             value = routes.get(path)
+            if callable(value):
+                value = value()
             if isinstance(value, Exception):
                 raise value
             if value is None:
@@ -329,7 +331,7 @@ class TelemetryTests(unittest.TestCase):
             },
         )
 
-    def test_operating_mode_write_uses_dynamic_mod_id_and_confirmed_readback(self):
+    def test_operating_mode_write_uses_controller_and_dual_confirmed_readback(self):
         for code, label in (
             (1, "Grid Tie"),
             (2, "Self Supply"),
@@ -337,9 +339,17 @@ class TelemetryTests(unittest.TestCase):
             (4, "Priority Backup"),
         ):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
-                path = "/device/27/model/inverter_status"
+                controller_path = "/device/1/model/REbus_dir"
+                status_path = "/device/27/model/inverter_status"
                 routes = {
                     "/devices": {
+                        "lcm": [{
+                            "lastheard": 0,
+                            "modID": 1,
+                            "power": 0,
+                            "rcpn": "LCM1",
+                            "type": "lcm",
+                        }],
                         "inv": [{
                             "lastheard": 1,
                             "modID": 27,
@@ -348,25 +358,82 @@ class TelemetryTests(unittest.TestCase):
                             "type": "inv",
                         }]
                     },
-                    path: {"fixed": {"SysMd": 3}},
+                    controller_path: {"fixed": {"SysMd": 3}},
+                    status_path: {"fixed": {"SysMd": 3}},
                 }
                 posts = []
 
                 def post(url, data, timeout):
                     posts.append((url, data, timeout))
-                    routes[path] = {"fixed": {"SysMd": code}}
+                    routes[controller_path] = {"fixed": {"SysMd": code}}
+                    routes[status_path] = {"fixed": {"SysMd": code}}
                     return Response(status=204)
 
-                collector = self.collector(directory, routes, request_post=post)
+                collector = self.collector(
+                    directory,
+                    routes,
+                    request_post=post,
+                    sleeper=lambda seconds: self.fail("unexpected confirmation wait"),
+                )
                 collector.poll()
                 snapshot = collector.set_system_operating_mode(code)
 
                 self.assertEqual(
                     posts,
-                    [(f"http://installer{path}", {"SysMd": str(code)}, 5)],
+                    [
+                        (
+                            f"http://installer{controller_path}",
+                            {"SysMd": str(code)},
+                            5,
+                        )
+                    ],
                 )
                 self.assertEqual(snapshot["inverter"]["system_operating_mode"], label)
                 self.assertEqual(snapshot["inverter"]["system_operating_mode_code"], code)
+
+    def test_operating_mode_confirmation_waits_five_seconds_for_delayed_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller_path = "/device/1/model/REbus_dir"
+            status_path = "/device/9/model/inverter_status"
+            command_sent = [False]
+            status_reads = [0]
+            sleeps = []
+
+            def status():
+                if not command_sent[0]:
+                    return {"fixed": {"SysMd": 3}}
+                status_reads[0] += 1
+                return {
+                    "fixed": {"SysMd": 2 if status_reads[0] >= 3 else 3}
+                }
+
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                controller_path: {"fixed": {"SysMd": 3}},
+                status_path: status,
+            }
+
+            def post(url, data, timeout):
+                self.assertEqual(url, f"http://installer{controller_path}")
+                routes[controller_path] = {"fixed": {"SysMd": 2}}
+                command_sent[0] = True
+                return Response(status=204)
+
+            collector = self.collector(
+                directory,
+                routes,
+                request_post=post,
+                sleeper=sleeps.append,
+            )
+            collector.poll()
+
+            snapshot = collector.set_system_operating_mode(2)
+
+            self.assertEqual(sleeps, [5.0, 5.0])
+            self.assertEqual(status_reads[0], 3)
+            self.assertEqual(
+                snapshot["inverter"]["system_operating_mode"], "Self Supply"
+            )
 
     def test_operating_mode_write_rejects_unsafe_or_malformed_codes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -381,48 +448,206 @@ class TelemetryTests(unittest.TestCase):
                     collector.set_system_operating_mode(code)
             self.assertEqual(posts, [])
 
-    def test_operating_mode_write_requires_inverter_and_matching_readback(self):
-        with tempfile.TemporaryDirectory() as directory:
-            no_inverter = self.collector(directory, {"/devices": {}})
-            no_inverter.poll()
-            with self.assertRaisesRegex(OperatingModeError, "no inverter"):
-                no_inverter.set_system_operating_mode(2)
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = "/device/9/model/inverter_status"
-            routes = {
-                "/devices": {
+    def test_operating_mode_write_requires_unique_controller_and_inverter(self):
+        cases = (
+            ({}, "controller"),
+            (
+                {
+                    "lcm": [{
+                        "lastheard": 0,
+                        "modID": 2,
+                        "power": 0,
+                        "rcpn": "LCM2",
+                        "type": "lcm",
+                    }],
                     "inv": [{
                         "lastheard": 1,
                         "modID": 9,
-                        "power": 1000,
+                        "power": 0,
                         "rcpn": "INV9",
                         "type": "inv",
-                    }]
+                    }],
                 },
-                path: {"fixed": {"SysMd": 3}},
+                "controller",
+            ),
+            (
+                {
+                    "lcm": [{
+                        "lastheard": 0,
+                        "modID": 1,
+                        "power": 0,
+                        "rcpn": "LCM1",
+                        "type": "lcm",
+                    }],
+                },
+                "inverter",
+            ),
+            (
+                {
+                    "lcm": [
+                        {
+                            "lastheard": 0,
+                            "modID": 1,
+                            "power": 0,
+                            "rcpn": "LCM1A",
+                            "type": "lcm",
+                        },
+                        {
+                            "lastheard": 0,
+                            "modID": 1,
+                            "power": 0,
+                            "rcpn": "LCM1B",
+                            "type": "lcm",
+                        },
+                    ],
+                    "inv": [{
+                        "lastheard": 1,
+                        "modID": 9,
+                        "power": 0,
+                        "rcpn": "INV9",
+                        "type": "inv",
+                    }],
+                },
+                "controller",
+            ),
+            (
+                {
+                    "lcm": [{
+                        "lastheard": 0,
+                        "modID": 1,
+                        "power": 0,
+                        "rcpn": "LCM1",
+                        "type": "lcm",
+                    }],
+                    "inv": [
+                        {
+                            "lastheard": 1,
+                            "modID": 9,
+                            "power": 0,
+                            "rcpn": "INV9",
+                            "type": "inv",
+                        },
+                        {
+                            "lastheard": 1,
+                            "modID": 27,
+                            "power": 0,
+                            "rcpn": "INV27",
+                            "type": "inv",
+                        },
+                    ],
+                },
+                "inverter",
+            ),
+        )
+        for devices, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                posts = []
+                collector = self.collector(
+                    directory,
+                    {"/devices": devices},
+                    request_post=lambda *args, **kwargs: posts.append((args, kwargs)),
+                )
+                collector.poll()
+                with self.assertRaisesRegex(OperatingModeError, message):
+                    collector.set_system_operating_mode(2)
+                self.assertEqual(posts, [])
+
+    def test_operating_mode_timeout_preserves_previous_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller_path = "/device/1/model/REbus_dir"
+            status_path = "/device/9/model/inverter_status"
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                controller_path: {"fixed": {"SysMd": 3}},
+                status_path: {"fixed": {"SysMd": 3}},
             }
+            sleeps = []
+
+            def post(url, data, timeout):
+                routes[controller_path] = {"fixed": {"SysMd": 2}}
+                return Response(status=204)
+
             collector = self.collector(
                 directory,
                 routes,
-                request_post=lambda *args, **kwargs: Response(status=200),
+                request_post=post,
+                sleeper=sleeps.append,
             )
             before = collector.poll()
-            with self.assertRaisesRegex(OperatingModeError, "expected 2"):
+
+            with self.assertRaisesRegex(
+                OperatingModeError,
+                r"not confirmed within 30 seconds.*controller=2.*inverter=3",
+            ):
                 collector.set_system_operating_mode(2)
+
+            self.assertEqual(sleeps, [5.0] * 6)
             self.assertEqual(
                 collector.current_snapshot()["inverter"]["system_operating_mode"],
                 before["inverter"]["system_operating_mode"],
             )
 
-            routes[path] = {"fixed": {"SysMd": "invalid"}}
-            with self.assertRaisesRegex(OperatingModeError, "numeric SysMd"):
-                collector.set_system_operating_mode(2)
+    def test_operating_mode_confirmation_recovers_from_malformed_and_failed_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller_path = "/device/1/model/REbus_dir"
+            status_path = "/device/9/model/inverter_status"
+            command_sent = [False]
+            controller_reads = [0]
+            status_reads = [0]
+            sleeps = []
+
+            def controller_readback():
+                if not command_sent[0]:
+                    return {"fixed": {"SysMd": 3}}
+                controller_reads[0] += 1
+                if controller_reads[0] == 1:
+                    return {"fixed": {"SysMd": "invalid"}}
+                return {"fixed": {"SysMd": 4}}
+
+            def status_readback():
+                if not command_sent[0]:
+                    return {"fixed": {"SysMd": 3}}
+                status_reads[0] += 1
+                if status_reads[0] == 1:
+                    return requests.exceptions.Timeout("mocked read timeout")
+                return {"fixed": {"SysMd": 4}}
+
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                controller_path: controller_readback,
+                status_path: status_readback,
+            }
+
+            def post(url, data, timeout):
+                command_sent[0] = True
+                return Response(status=204)
+
+            collector = self.collector(
+                directory,
+                routes,
+                request_post=post,
+                sleeper=sleeps.append,
+            )
+            collector.poll()
+
+            snapshot = collector.set_system_operating_mode(4)
+
+            self.assertEqual(sleeps, [5.0])
+            self.assertEqual(
+                snapshot["inverter"]["system_operating_mode"], "Priority Backup"
+            )
 
     def test_operating_mode_write_wraps_mocked_transport_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             routes = {
                 "/devices": {
+                    "lcm": [{
+                        "lastheard": 0,
+                        "modID": 1,
+                        "power": 0,
+                        "rcpn": "LCM1",
+                        "type": "lcm",
+                    }],
                     "inv": [{
                         "lastheard": 1,
                         "modID": 9,
@@ -447,6 +672,13 @@ class TelemetryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             routes = {
                 "/devices": {
+                    "lcm": [{
+                        "lastheard": 0,
+                        "modID": 1,
+                        "power": 0,
+                        "rcpn": "LCM1",
+                        "type": "lcm",
+                    }],
                     "inv": [{
                         "lastheard": 1,
                         "modID": 9,
@@ -636,9 +868,17 @@ class TelemetryTests(unittest.TestCase):
 
     def test_detail_reads_and_mode_confirmation_share_request_lock(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = "/device/9/model/inverter_status"
+            controller_path = "/device/1/model/REbus_dir"
+            status_path = "/device/9/model/inverter_status"
             routes = {
                 "/devices": {
+                    "lcm": [{
+                        "lastheard": 0,
+                        "modID": 1,
+                        "power": 0,
+                        "rcpn": "LCM1",
+                        "type": "lcm",
+                    }],
                     "inv": [{
                         "lastheard": 1,
                         "modID": 9,
@@ -647,7 +887,8 @@ class TelemetryTests(unittest.TestCase):
                         "type": "inv",
                     }]
                 },
-                path: {"fixed": {"SysMd": 2}},
+                controller_path: {"fixed": {"SysMd": 2}},
+                status_path: {"fixed": {"SysMd": 2}},
             }
             collector = None
 
@@ -664,6 +905,7 @@ class TelemetryTests(unittest.TestCase):
                 routes,
                 detail_request_get=detail_get,
                 request_post=post,
+                sleeper=lambda seconds: self.fail("unexpected confirmation wait"),
             )
             collector.poll_primary()
             collector._run_detail_task(("INV9", 9, "common"))
