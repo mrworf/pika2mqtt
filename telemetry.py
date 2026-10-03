@@ -289,6 +289,8 @@ class InstallerTelemetry:
     MODEL_INTERVAL = 60
     MODEL_STALE_AFTER = 120
     MAX_MODEL_BACKOFF = 900
+    MAX_MODEL_BACKOFF_JITTER = 60
+    SLOW_DETAIL_REQUEST_SECONDS = 5.0
 
     def __init__(
         self,
@@ -298,6 +300,7 @@ class InstallerTelemetry:
         transport: Any = None,
         detail_interval: int = MODEL_INTERVAL,
         detail_stale_after: int = MODEL_STALE_AFTER,
+        detail_request_timeout: float = 20.0,
         disconnect_after: int = 120,
         clock: Callable[[], float] = time.time,
         request_get: Callable[..., Any] = requests.get,
@@ -315,6 +318,14 @@ class InstallerTelemetry:
         self.transport = transport
         self.detail_interval = detail_interval
         self.detail_stale_after = detail_stale_after
+        if (
+            isinstance(detail_request_timeout, bool)
+            or not isinstance(detail_request_timeout, (int, float))
+            or not math.isfinite(detail_request_timeout)
+            or detail_request_timeout < 1
+        ):
+            raise ValueError("detail request timeout must be at least 1 second")
+        self.detail_request_timeout = float(detail_request_timeout)
         self.disconnect_after = disconnect_after
         self.clock = clock
         self.request_get = request_get
@@ -354,16 +365,19 @@ class InstallerTelemetry:
         path: str,
         request_get: Callable[..., Any] | None = None,
         report_transport: bool = True,
+        timeout: float = 5.0,
     ) -> dict[str, Any]:
         getter = request_get or self.request_get
         try:
-            response = getter(self.base_url + path, timeout=5)
+            response = getter(self.base_url + path, timeout=timeout)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
             if report_transport and self.transport:
                 self.transport.report_transport_failure(error)
             raise
         if response.status_code != 200:
-            raise requests.exceptions.HTTPError(f"HTTP {response.status_code} for {path}")
+            raise requests.exceptions.HTTPError(
+                f"HTTP {response.status_code} for {path}", response=response
+            )
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError(f"non-object response for {path}")
@@ -512,9 +526,9 @@ class InstallerTelemetry:
             return None
         return number
 
-    def _pv_link_directory_match_locked(
+    def _pv_link_directory_entry_locked(
         self, serial: str, payload: Any
-    ) -> tuple[str, int, bool]:
+    ) -> tuple[str, int, dict[str, Any]]:
         if not isinstance(serial, str):
             raise PvLinkControlError(f"PV Link serial {serial!r} is invalid")
         normalized = serial.upper()
@@ -565,7 +579,7 @@ class InstallerTelemetry:
         manufacturer = int(normalized[0:4], 16)
         device_type = int(normalized[4:8], 16)
         device_id = int(normalized[8:12], 16)
-        matches: list[tuple[int, bool]] = []
+        matches: list[tuple[int, dict[str, Any]]] = []
         for raw_block, entry in repeating.items():
             try:
                 block = int(raw_block)
@@ -586,13 +600,21 @@ class InstallerTelemetry:
                 raise PvLinkControlError(
                     f"controller directory has an invalid Ena value for {normalized}"
                 )
-            matches.append((block, bool(enabled)))
+            matches.append((block, dict(entry)))
         if len(matches) != 1:
             raise PvLinkControlError(
                 f"controller directory has {len(matches)} matches for PV Link {normalized}"
             )
-        block, enabled = matches[0]
-        return controllers[0][0], block, enabled
+        block, entry = matches[0]
+        return controllers[0][0], block, entry
+
+    def _pv_link_directory_match_locked(
+        self, serial: str, payload: Any
+    ) -> tuple[str, int, bool]:
+        controller, block, entry = self._pv_link_directory_entry_locked(
+            serial, payload
+        )
+        return controller, block, bool(self._directory_integer(entry.get("Ena")))
 
     def _pv_link_directory_match(
         self, serial: str, payload: Any
@@ -622,6 +644,35 @@ class InstallerTelemetry:
         except PvLinkControlError:
             return None
         return block, enabled
+
+    def _fresh_pv_link_directory_entry(
+        self, serial: str, now: float
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        controllers = [
+            candidate
+            for candidate, device in self._last_devices.items()
+            if device.get("kind") == "lcm" and self._device_mod_id(device) == 1
+        ]
+        if len(controllers) != 1:
+            return None, {"available": False, "fresh": False}
+        key = (controllers[0], "REbus_dir")
+        health = dict(self._endpoint_health.get(key, {}))
+        last_success = health.get("last_success")
+        age = max(0.0, now - last_success) if last_success is not None else None
+        health["data_age_seconds"] = age
+        health["fresh"] = bool(
+            age is not None and age <= self.detail_stale_after
+        )
+        if not health["fresh"]:
+            return None, health
+        try:
+            _, _, entry = self._pv_link_directory_entry_locked(
+                serial, self._details.get(key)
+            )
+        except PvLinkControlError as error:
+            health.update({"available": False, "fresh": False, "last_error": str(error)})
+            return None, health
+        return entry, health
 
     def set_pv_link_enabled(self, serial: str, enabled: bool) -> dict[str, Any]:
         if not isinstance(enabled, bool):
@@ -776,14 +827,50 @@ class InstallerTelemetry:
         key: tuple[str, str],
         payload: dict[str, Any],
         now: float,
+        duration: float | None = None,
     ) -> None:
         failures = self._failures.get(key, 0)
         self._details[key] = payload
         self._failures[key] = 0
         self._next_detail[key] = now + self.detail_interval
-        self._endpoint_health[key] = {"available": True, "last_success": int(now)}
+        health = {
+            "available": True,
+            "last_success": int(now),
+            "last_attempt": int(now),
+            "consecutive_failures": 0,
+            "next_retry_at": None,
+        }
+        if duration is not None:
+            health["last_request_duration_seconds"] = round(duration, 3)
+        self._endpoint_health[key] = health
         if failures:
-            LOG.info("Installer model %s for %s recovered", key[1], key[0])
+            LOG.info(
+                "Installer model %s for %s recovered%s",
+                key[1],
+                key[0],
+                f" in {duration:.1f}s" if duration is not None else "",
+            )
+        elif duration is not None and duration > self.SLOW_DETAIL_REQUEST_SECONDS:
+            LOG.info(
+                "Slow installer model %s for %s completed in %.1fs",
+                key[1],
+                key[0],
+                duration,
+            )
+
+    @staticmethod
+    def _detail_failure_kind(error: BaseException) -> str:
+        if isinstance(error, requests.exceptions.Timeout):
+            return "timeout"
+        if isinstance(error, requests.exceptions.ConnectionError):
+            return "connection"
+        if isinstance(error, requests.exceptions.HTTPError):
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None)
+            return f"http_{status}" if status is not None else "http"
+        if isinstance(error, ValueError):
+            return "invalid_response"
+        return type(error).__name__.lower()
 
     def _record_detail_failure(
         self,
@@ -791,6 +878,7 @@ class InstallerTelemetry:
         error: BaseException,
         now: float,
         stagger: bool,
+        duration: float | None = None,
     ) -> None:
         failures = self._failures.get(key, 0) + 1
         self._failures[key] = failures
@@ -798,22 +886,41 @@ class InstallerTelemetry:
             self.MAX_MODEL_BACKOFF,
             self.detail_interval * (2 ** (failures - 1)),
         )
-        jitter_limit = min(15.0, base_delay * 0.25) if stagger else 0.0
+        if stagger and base_delay >= self.MAX_MODEL_BACKOFF:
+            jitter_limit = self.MAX_MODEL_BACKOFF_JITTER
+        else:
+            jitter_limit = min(15.0, base_delay * 0.25) if stagger else 0.0
         jitter = self.retry_jitter(0.0, jitter_limit) if jitter_limit else 0.0
-        delay = min(self.MAX_MODEL_BACKOFF, base_delay + jitter)
+        delay = base_delay + jitter
         self._next_detail[key] = now + delay
         health = self._endpoint_health.setdefault(key, {})
+        failure_kind = self._detail_failure_kind(error)
+        error_text = str(error)
+        should_warn = (
+            health.get("available") is not False
+            or health.get("failure_kind") != failure_kind
+            or health.get("last_error") != error_text
+        )
         health.update(
             {
                 "available": False,
-                "last_error": str(error),
+                "last_error": error_text,
+                "failure_kind": failure_kind,
+                "last_attempt": int(now),
+                "consecutive_failures": failures,
                 "retry_in_seconds": delay,
+                "next_retry_at": now + delay,
             }
         )
-        LOG.warning(
-            "Installer model %s for %s unavailable; retrying in %.1fs: %s",
+        if duration is not None:
+            health["last_request_duration_seconds"] = round(duration, 3)
+        log = LOG.warning if should_warn else LOG.debug
+        log(
+            "Installer model %s for %s unavailable after %.1fs; "
+            "retrying in %.1fs: %s",
             key[1],
             key[0],
+            duration or 0.0,
             delay,
             error,
         )
@@ -834,19 +941,29 @@ class InstallerTelemetry:
                 if now < next_detail:
                     continue
                 path = self._model_path(device["modID"], model)
+                started = time.monotonic()
                 try:
                     with self._detail_request_lock:
                         payload = self._get_json(
                             path,
                             request_get=self.detail_request_get,
                             report_transport=False,
+                            timeout=self.detail_request_timeout,
                         )
                 except (requests.RequestException, ValueError, TypeError) as error:
                     with self._lock:
-                        self._record_detail_failure(key, error, now, stagger=False)
+                        self._record_detail_failure(
+                            key,
+                            error,
+                            now,
+                            stagger=False,
+                            duration=time.monotonic() - started,
+                        )
                 else:
                     with self._lock:
-                        self._record_detail_success(key, payload, now)
+                        self._record_detail_success(
+                            key, payload, now, duration=time.monotonic() - started
+                        )
 
     def _next_detail_task(
         self, now: float
@@ -858,32 +975,40 @@ class InstallerTelemetry:
                     continue
                 for model in self._models_for(device["kind"]):
                     due = self._next_detail.get((serial, model), 0.0)
+                    priority = 0 if model == "REbus_dir" else 1
                     candidates.append(
-                        (due, serial, int(device["modID"]), model)
+                        (due, priority, serial, int(device["modID"]), model)
                     )
         if not candidates:
             return None, 1.0
-        due, serial, mod_id, model = min(candidates)
-        if due > now:
+        due_candidates = [candidate for candidate in candidates if candidate[0] <= now]
+        if not due_candidates:
+            due = min(candidate[0] for candidate in candidates)
             return None, min(1.0, due - now)
+        due, _, serial, mod_id, model = min(
+            due_candidates, key=lambda candidate: (candidate[1], candidate[0], candidate[2], candidate[4])
+        )
         return (serial, mod_id, model), 0.0
 
     def _run_detail_task(self, task: tuple[str, int, str]) -> None:
         serial, mod_id, model = task
         key = (serial, model)
         path = self._model_path(mod_id, model)
+        started = time.monotonic()
         try:
             with self._detail_request_lock:
                 payload = self._get_json(
                     path,
                     request_get=self.detail_request_get,
                     report_transport=False,
+                    timeout=self.detail_request_timeout,
                 )
             error = None
         except (requests.RequestException, ValueError, TypeError) as caught:
             payload = None
             error = caught
         now = self.clock()
+        duration = time.monotonic() - started
         with self._lock:
             current = self._last_devices.get(serial)
             if current is None or int(current["modID"]) != mod_id:
@@ -895,9 +1020,11 @@ class InstallerTelemetry:
                 )
                 return
             if error is not None:
-                self._record_detail_failure(key, error, now, stagger=True)
+                self._record_detail_failure(
+                    key, error, now, stagger=True, duration=duration
+                )
             else:
-                self._record_detail_success(key, payload, now)
+                self._record_detail_success(key, payload, now, duration=duration)
 
     def _detail_loop(self) -> None:
         LOG.info("Starting installer detail collector")
@@ -1017,6 +1144,38 @@ class InstallerTelemetry:
                 "rebus_bits": rebus.get("RB"),
             })
 
+    @staticmethod
+    def _apply_pv_directory(
+        state: dict[str, Any], entry: dict[str, Any]
+    ) -> bool:
+        raw_status = entry.get("St")
+        status_available = (
+            isinstance(raw_status, (int, float))
+            and not isinstance(raw_status, bool)
+            and math.isfinite(raw_status)
+            and int(raw_status) == raw_status
+        )
+        if status_available:
+            state.update(decode_rebus_state(raw_status))
+        power = _number(entry, "P")
+        if _valid_pv_power(power):
+            state["rebus_power_w"] = power
+        else:
+            state.pop("rebus_power_w", None)
+        for target, source in (
+            ("voltage_v", "V"),
+            ("current_a", "I"),
+            ("temperature_c", "T"),
+        ):
+            value = _number(entry, source)
+            if value is not None:
+                state[target] = value
+        if "Rb" in entry:
+            state["rebus_bits"] = entry["Rb"]
+        if "UpdtTm" in entry:
+            state["directory_updated_at"] = entry["UpdtTm"]
+        return status_available
+
     def _pv_state(self, serial: str, now: float) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
         state = self._base_device(serial, "pv", now)
         issues = []
@@ -1042,7 +1201,16 @@ class InstallerTelemetry:
         if invalid_rebus_power:
             state.pop("rebus_power_w", None)
         pv = self._fresh_fixed(state, "pvlink_status")
-        directory = self._fresh_pv_link_directory_match(serial, now)
+        directory_entry, directory_health = self._fresh_pv_link_directory_entry(
+            serial, now
+        )
+        state["endpoint_health"]["controller_directory"] = directory_health
+        directory_core_available = False
+        if directory_entry is not None:
+            directory_core_available = self._apply_pv_directory(
+                state, directory_entry
+            )
+        directory_health["core_state_available"] = directory_core_available
         pvrss = self._fresh_fixed(state, "pvrss_telemetry")
         result = pvrss.get("SelfTestResults")
         result_number = int(result) if isinstance(result, (int, float)) else None
@@ -1056,9 +1224,10 @@ class InstallerTelemetry:
             })
         else:
             state["error_word"] = 0
-        if directory is not None:
-            _, directory_enabled = directory
-            state["enabled"] = directory_enabled
+        if directory_entry is not None:
+            state["enabled"] = bool(
+                self._directory_integer(directory_entry.get("Ena"))
+            )
             state["enable_control_available"] = True
         else:
             state["enable_control_available"] = False
@@ -1087,13 +1256,26 @@ class InstallerTelemetry:
         assessment_complete = all(
             state["endpoint_health"][model]["fresh"] for model in assessment_models
         )
+        detailed_fault_coverage = all(
+            state["endpoint_health"][model]["fresh"]
+            for model in ("pvlink_status", "pvrss_telemetry")
+        )
+        core_fault_available = directory_core_available or assessment_complete
         state["fault_reasons"] = sorted(set(fault_reasons))
         state["fault_assessment_complete"] = assessment_complete
-        state["fault"] = True if state["fault_reasons"] else (False if assessment_complete else None)
+        state["detailed_fault_coverage"] = detailed_fault_coverage
+        state["core_state_available"] = directory_core_available or bool(
+            state["endpoint_health"]["REbus_status"].get("fresh")
+        )
+        state["fault"] = (
+            True
+            if state["fault_reasons"]
+            else (False if core_fault_available else None)
+        )
         state["fault_summary"] = (
             ", ".join(state["fault_reasons"])
             if state["fault_reasons"]
-            else ("none" if assessment_complete else "unknown")
+            else ("none" if core_fault_available else "unknown")
         )
         return state, issues
 

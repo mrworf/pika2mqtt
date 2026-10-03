@@ -21,6 +21,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(args.pv_inventory_file, "/data/pv_inventory.json")
         self.assertFalse(args.pv_inventory_freeze)
         self.assertEqual(args.disconnect_after, 120)
+        self.assertEqual(args.detail_request_timeout, 20)
         self.assertFalse(args.operating_mode_control)
 
     @mock.patch.dict(
@@ -30,6 +31,7 @@ class ConfigurationTests(unittest.TestCase):
             "HA_DISCOVERY_ENABLED": "false",
             "MQTT_PORT": "2883",
             "OPERATING_MODE_CONTROL_ENABLED": "true",
+            "DETAIL_REQUEST_TIMEOUT": "27.5",
         },
         clear=True,
     )
@@ -40,6 +42,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(args.ha_discovery)
         self.assertEqual(args.mqtt_port, 2883)
         self.assertTrue(args.operating_mode_control)
+        self.assertEqual(args.detail_request_timeout, 27.5)
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_operating_mode_control_cli_overrides_default(self):
@@ -54,7 +57,13 @@ class ConfigurationTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_invalid_ranges_and_empty_discovery_prefix_are_rejected(self):
-        for extra in (("--mqtt-port", "0"), ("--disconnect-after", "0"), ("--refresh", "0")):
+        for extra in (
+            ("--mqtt-port", "0"),
+            ("--disconnect-after", "0"),
+            ("--refresh", "0"),
+            ("--detail-request-timeout", "0"),
+            ("--detail-request-timeout", "nan"),
+        ):
             with self.subTest(extra=extra):
                 with self.assertRaises(ValueError):
                     validate_arguments(self.parse(*extra))

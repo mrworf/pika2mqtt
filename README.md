@@ -91,6 +91,15 @@ MQTT ACLs and Home Assistant user permissions before upgrading, or set the flag
 to `false` until PV Link control is desired. The read-only Enabled entity and
 all existing state topics remain compatible.
 
+This release also changes PV Link availability semantics. Core status and
+fault monitoring now use the controller directory and remain available when
+firmware rejects optional per-PV model reads. The existing Fault and Status
+entity identifiers are unchanged. A new disabled-by-default `Detailed fault
+data unavailable` diagnostic reports when PVLink/PVRSS-specific coverage is
+missing. Existing deployments need no configuration change; optionally set
+`DETAIL_REQUEST_TIMEOUT` if the 20-second default is unsuitable for a
+particularly slow appliance.
+
 - The SSH private key is now mandatory and should be mounted read-only.
 - `SSH_HOST_FINGERPRINT` is mandatory.
 - The Docker host must reach the inverter on TCP/22.
@@ -283,6 +292,7 @@ file is preferred. The file takes precedence if both are set.
 | `SSH_LOCAL_PORT` | `18080` | Internal loopback tunnel port |
 | `REFRESH` | `15` | `/devices` polling interval in seconds |
 | `DETAIL_REFRESH` | `60` | Successful model polling interval in seconds |
+| `DETAIL_REQUEST_TIMEOUT` | `20` | Background installer model request timeout in seconds |
 | `DISCONNECT_AFTER` | `120` | Seconds before API/PV Link data is disconnected |
 | `PV_INVENTORY_FILE` | `/data/pv_inventory.json` | Versioned learned PV Link inventory |
 | `PV_INVENTORY_FREEZE` | `false` | Prevent newly observed PV Links from being learned |
@@ -479,20 +489,30 @@ failure continues to use the last confirmed value, but after that window only
 the affected model-backed entities become unavailable. `/devices` power,
 last-heard age, and communication monitoring remain usable. Cached raw model
 payloads remain in MQTT JSON for diagnosis with `endpoint_health` freshness and
-age metadata, but stale data is not used for normalized values or fault
-decisions. Faults cover REbus error states, PV Link error bits, PVRSS lockout,
-and failed PVRSS self-tests. The system device provides separate aggregate
-“any string disconnected” and “any string faulted” binary sensors for alerting.
+age, request duration, failure classification, consecutive-failure, and retry
+metadata, but stale data is not used for normalized values or fault decisions.
+The controller directory supplies each PV Link's core REbus status, voltage,
+current, temperature, enabled state, and safe power fields. Core Fault remains
+available from that source when optional PV models fail. Fresh optional models
+add PV Link error bits, PVRSS lockout, and failed PVRSS self-tests; the
+disabled-by-default `Detailed fault data unavailable` diagnostic identifies
+reduced coverage. The system device provides separate aggregate “any string
+disconnected” and “any string faulted” binary sensors for alerting.
 
 The collector follows the endpoint contract used by the installer UI:
 `/devices`; controller `REbus_dir/devices`; inverter `common`, `REbus_status`,
 `inverter_status`, `REbus_exp`, and `inverter`; battery `common`, `REbus_status`,
 and `battery`; and PV Link `common`, `REbus_status`, `pvlink_status`, and
 `pvrss_telemetry`. Detailed model
-requests run serially in a separate worker with a persistent HTTP session, so a
-slow or hung model cannot delay `/devices` polling. Requests are spaced rather
-than sent as one synchronized burst. Detailed model errors are logged and
-retried with staggered per-route exponential backoff capped at 15 minutes.
+requests run serially in a separate worker with a persistent HTTP session and
+a configurable 20-second timeout, so a slow or hung model cannot delay
+`/devices` polling. The fast controller directory is prioritized when several
+routes are due. Requests are spaced rather than sent as one synchronized
+burst. Detailed model errors are classified and retried with staggered
+per-route exponential backoff using a 15-minute base at the maximum cadence.
+The installer does not provide `Retry-After`; directory `UpdtTm` values are
+sample timestamps, not requested polling delays. Identical persistent failures
+warn once until the error changes or the endpoint recovers.
 HTTP 500 responses and read timeouts from an individual model affect only that
 endpoint; they do not recycle a healthy SSH tunnel. Primary `/devices`
 connection failures remain authoritative for tunnel-health recovery.

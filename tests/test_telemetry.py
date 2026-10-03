@@ -1049,6 +1049,145 @@ class TelemetryTests(unittest.TestCase):
                 self.assertEqual(collector._endpoint_health[key]["retry_in_seconds"], delay)
                 now[0] = collector._next_detail[key]
 
+    def test_detail_timeout_accepts_slow_success_and_records_duration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            timeouts = []
+
+            def detail_get(url, timeout):
+                timeouts.append(timeout)
+                return Response({"fixed": {"Ena": 1}})
+
+            collector = self.collector(
+                directory,
+                {"/devices": self.fixture("devices.json")},
+                detail_request_get=detail_get,
+                detail_request_timeout=20,
+            )
+            collector.poll_primary()
+            with mock.patch("telemetry.time.monotonic", side_effect=[100, 113]):
+                with self.assertLogs("telemetry", level="INFO") as logs:
+                    collector._run_detail_task(
+                        ("000100030001", 3, "pvlink_status")
+                    )
+
+            health = collector._endpoint_health[
+                ("000100030001", "pvlink_status")
+            ]
+            self.assertEqual(timeouts, [20.0])
+            self.assertTrue(health["available"])
+            self.assertEqual(health["last_request_duration_seconds"], 13)
+            self.assertIn("completed in 13.0s", "\n".join(logs.output))
+
+    def test_repeated_identical_detail_failure_warns_once_and_keeps_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = self.collector(
+                directory,
+                {"/devices": self.fixture("devices.json")},
+                detail_request_get=lambda url, timeout: Response(status=500),
+                retry_jitter=lambda low, high: high,
+            )
+            collector.poll_primary()
+            task = ("000100030001", 3, "pvlink_status")
+            with self.assertLogs("telemetry", level="WARNING"):
+                collector._run_detail_task(task)
+            with self.assertNoLogs("telemetry", level="WARNING"):
+                collector._run_detail_task(task)
+
+            health = collector._endpoint_health[(task[0], task[2])]
+            self.assertEqual(health["failure_kind"], "http_500")
+            self.assertEqual(health["consecutive_failures"], 2)
+            self.assertIn("last_request_duration_seconds", health)
+            self.assertIn("next_retry_at", health)
+
+    def test_capped_background_retry_retains_jitter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = self.collector(
+                directory,
+                {"/devices": self.fixture("devices.json")},
+                detail_request_get=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    requests.exceptions.ReadTimeout("mocked timeout")
+                ),
+                retry_jitter=lambda low, high: high,
+            )
+            collector.poll_primary()
+            key = ("000100030001", "pvlink_status")
+            collector._failures[key] = 4
+            collector._run_detail_task((key[0], 3, key[1]))
+            self.assertEqual(
+                collector._endpoint_health[key]["retry_in_seconds"], 960
+            )
+
+    def test_due_controller_directory_is_prioritized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = self.collector(
+                directory, {"/devices": self.fixture("devices.json")}
+            )
+            collector.poll_primary()
+            task, wait_for = collector._next_detail_task(1000)
+            self.assertEqual(task, ("000100120001", 1, "REbus_dir"))
+            self.assertEqual(wait_for, 0)
+
+    def test_controller_directory_keeps_core_pv_state_when_details_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_payload = {
+                "fixed": {"UpdtN": 63},
+                "repeating": {
+                    "2": {
+                        "Man": 1,
+                        "Dev": 3,
+                        "ID": 1,
+                        "UnitID": 3,
+                        "Ena": 1,
+                        "St": 0x2010,
+                        "P": 312,
+                        "V": 392.7,
+                        "I": 2.4,
+                        "T": 31.5,
+                        "Rb": 19,
+                        "E": 4293529975,
+                        "UpdtTm": 999,
+                    }
+                },
+            }
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                "/device/1/model/REbus_dir/devices": directory_payload,
+            }
+            collector = self.collector(directory, routes)
+            pv = collector.poll()["pv_links"]["000100030001"]
+
+            self.assertTrue(pv["core_state_available"])
+            self.assertEqual(pv["status"], "making_power")
+            self.assertEqual(pv["voltage_v"], 392.7)
+            self.assertEqual(pv["current_a"], 2.4)
+            self.assertEqual(pv["temperature_c"], 31.5)
+            self.assertEqual(pv["rebus_bits"], 19)
+            self.assertEqual(pv["directory_updated_at"], 999)
+            self.assertTrue(pv["enabled"])
+            self.assertFalse(pv["fault"])
+            self.assertEqual(pv["fault_summary"], "none")
+            self.assertFalse(pv["detailed_fault_coverage"])
+            self.assertNotIn("accumulated_energy_kwh", pv)
+
+            collector.clock = lambda: 1121
+            stale = collector.current_snapshot()["pv_links"]["000100030001"]
+            self.assertFalse(stale["core_state_available"])
+            self.assertIsNone(stale["fault"])
+            self.assertEqual(stale["fault_summary"], "unknown")
+
+    def test_directory_without_status_cannot_synthesize_healthy_fault_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installer = FakePvDirectoryInstaller()
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                installer.PATH: installer.get,
+            }
+            collector = self.collector(directory, routes)
+            pv = collector.poll()["pv_links"]["000100030001"]
+            self.assertFalse(pv["core_state_available"])
+            self.assertIsNone(pv["fault"])
+            self.assertEqual(pv["fault_summary"], "unknown")
+
     def test_background_details_do_not_block_primary_polling(self):
         with tempfile.TemporaryDirectory() as directory:
             devices = self.fixture("devices.json")

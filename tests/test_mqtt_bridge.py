@@ -46,7 +46,7 @@ def snapshot():
         "inverter": {"serial": "0001000706FA", "power_w": 1000, "accumulated_energy_kwh": 42, "status": "making_power", "system_operating_mode": "Clean Backup"},
         "grid": {"power_w": 500, "import_power_w": 0, "export_power_w": 500, "import_energy_kwh": 2, "export_energy_kwh": 41},
         "batteries": [{"serial": "000100080701", "power_w": -100, "input_power_w": 100, "output_power_w": 0, "state_of_charge_percent": 90.5, "status": "charging_battery"}],
-        "pv_links": {"00010003119C": {"serial": "00010003119C", "connected": True, "fault": False, "power_w": 1200, "status": "making_power", "last_heard_seconds": 2, "enabled": True, "enable_control_available": True}},
+        "pv_links": {"00010003119C": {"serial": "00010003119C", "connected": True, "fault": False, "power_w": 1200, "status": "making_power", "last_heard_seconds": 2, "enabled": True, "enable_control_available": True, "core_state_available": True, "detailed_fault_coverage": True}},
     }
 
 
@@ -538,6 +538,14 @@ class MqttBridgeTests(unittest.TestCase):
             ),
             values,
         )
+        self.assertIn(
+            ("house/energy/availability/pv/00010003119C/core", "available"),
+            values,
+        )
+        self.assertIn(
+            ("house/energy/availability/pv/00010003119C/fault", "available"),
+            values,
+        )
 
         child = next(
             json.loads(payload)
@@ -562,16 +570,20 @@ class MqttBridgeTests(unittest.TestCase):
             enabled_topics,
         )
         self.assertIn(
-            "house/energy/availability/model/00010003119C/REbus_status",
+            "house/energy/availability/pv/00010003119C/core",
             status_topics,
         )
-        self.assertTrue(
-            {
-                "house/energy/availability/model/00010003119C/REbus_status",
-                "house/energy/availability/model/00010003119C/pvlink_status",
-                "house/energy/availability/model/00010003119C/pvrss_telemetry",
-            }.issubset(fault_topics)
+        self.assertIn(
+            "house/energy/availability/pv/00010003119C/fault",
+            fault_topics,
         )
+        self.assertNotIn(
+            "house/energy/availability/model/00010003119C/pvlink_status",
+            fault_topics,
+        )
+        coverage = components["detailed_fault_data_unavailable"]
+        self.assertFalse(coverage["enabled_by_default"])
+        self.assertEqual(coverage["device_class"], "problem")
 
     def test_home_assistant_birth_and_reconnect_republish(self):
         self.bridge.publish_snapshot(snapshot())

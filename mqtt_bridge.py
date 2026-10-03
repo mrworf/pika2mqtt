@@ -263,6 +263,14 @@ class MqttBridge:
                 self._topic(f"availability/pv/{serial}/enabled"),
                 "available" if pv.get("enabled") is not None else "unavailable",
             )
+            self._publish(
+                self._topic(f"availability/pv/{serial}/core"),
+                "available" if pv.get("core_state_available") else "unavailable",
+            )
+            self._publish(
+                self._topic(f"availability/pv/{serial}/fault"),
+                "available" if pv.get("fault") is not None else "unavailable",
+            )
             if self.operating_mode_control_enabled:
                 self._publish(
                     self._topic(f"availability/control/pv/{serial}"),
@@ -608,6 +616,20 @@ class MqttBridge:
         pvlink_availability = self._model_availability(
             measurement_availability, serial, "pvlink_status"
         )
+        core_availability = measurement_availability + [
+            {
+                "topic": self._topic(f"availability/pv/{serial}/core"),
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            }
+        ]
+        fault_availability = measurement_availability + [
+            {
+                "topic": self._topic(f"availability/pv/{serial}/fault"),
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            }
+        ]
         enabled_availability = measurement_availability + [
             {
                 "topic": self._topic(f"availability/pv/{serial}/enabled"),
@@ -618,29 +640,26 @@ class MqttBridge:
         pvrss_availability = self._model_availability(
             measurement_availability, serial, "pvrss_telemetry"
         )
-        fault_availability = self._model_availability(
-            measurement_availability,
-            serial,
-            "REbus_status",
-            "pvlink_status",
-            "pvrss_telemetry",
-        )
         components = {
             "disconnected": self._component("binary_sensor", f"{child}_disconnected", "Communication lost", topic, "{{ 'OFF' if value_json.connected else 'ON' }}", connected_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
             "fault": self._component("binary_sensor", f"{child}_fault", "Fault", topic, "{{ 'ON' if value_json.fault == true else 'OFF' }}", fault_availability, payload_on="ON", payload_off="OFF", device_class="problem"),
             "fault_summary": self._sensor(child, "fault_summary", "Fault summary", topic, availability=fault_availability, entity_category="diagnostic"),
+            "detailed_fault_data_unavailable": self._component("binary_sensor", f"{child}_detailed_fault_data_unavailable", "Detailed fault data unavailable", topic, "{{ 'OFF' if value_json.detailed_fault_coverage else 'ON' }}", measurement_availability, payload_on="ON", payload_off="OFF", device_class="problem", entity_category="diagnostic", enabled_by_default=False),
             "power": self._sensor(child, "power_w", "Power", topic, availability=power_availability, device_class="power", unit_of_measurement="W", state_class="measurement"),
             "input_voltage": self._sensor(child, "input_voltage_v", "Input voltage", topic, availability=pvlink_availability, device_class="voltage", unit_of_measurement="V", state_class="measurement"),
             "input_current": self._sensor(child, "input_current_a", "Input current", topic, availability=pvlink_availability, device_class="current", unit_of_measurement="A", state_class="measurement"),
             "energy": self._sensor(child, "accumulated_energy_kwh", "Accumulated energy", topic, availability=rebus_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
-            "status": self._sensor(child, "status", "Status", topic, availability=rebus_availability),
+            "status": self._sensor(child, "status", "Status", topic, availability=core_availability),
+            "voltage": self._sensor(child, "voltage_v", "REbus voltage", topic, availability=core_availability, device_class="voltage", unit_of_measurement="V", state_class="measurement"),
+            "current": self._sensor(child, "current_a", "REbus current", topic, availability=core_availability, device_class="current", unit_of_measurement="A", state_class="measurement"),
+            "temperature": self._sensor(child, "temperature_c", "Temperature", topic, availability=core_availability, device_class="temperature", unit_of_measurement="°C", state_class="measurement"),
             "enabled": self._binary(child, "enabled", "Enabled", topic, availability=enabled_availability, entity_category="diagnostic"),
             "last_heard": self._sensor(child, "last_heard_seconds", "Last heard age", topic, availability=connected_availability, device_class="duration", unit_of_measurement="s", state_class="measurement", entity_category="diagnostic"),
             "snaprs_installed": self._sensor(child, "snaprs_installed", "SnapRS installed", topic, availability=pvrss_availability, entity_category="diagnostic"),
             "snaprs_detected": self._sensor(child, "snaprs_detected", "SnapRS detected", topic, availability=pvrss_availability, entity_category="diagnostic"),
             "pvrss_self_test": self._sensor(child, "pvrss_self_test", "PVRSS self-test", topic, availability=pvrss_availability, entity_category="diagnostic"),
             "error_word": self._sensor(child, "error_word", "Error word", topic, availability=pvlink_availability, entity_category="diagnostic", enabled_by_default=False),
-            "status_code": self._sensor(child, "status_code", "Status code", topic, availability=rebus_availability, entity_category="diagnostic", enabled_by_default=False),
+            "status_code": self._sensor(child, "status_code", "Status code", topic, availability=core_availability, entity_category="diagnostic", enabled_by_default=False),
         }
         if self.operating_mode_control_enabled:
             control_availability = measurement_availability + [

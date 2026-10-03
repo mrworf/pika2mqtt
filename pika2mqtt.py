@@ -3,6 +3,7 @@
 
 import argparse
 import logging
+import math
 import os
 import signal
 import sys
@@ -168,6 +169,7 @@ def build_parser():
     parser.add_argument("--ssh-local-port", type=int, default=int(os.getenv("SSH_LOCAL_PORT", "18080")), help="Loopback port used by the SSH tunnel")
     parser.add_argument("--refresh", type=int, default=int(os.getenv("REFRESH", "15")), help="Device polling interval in seconds")
     parser.add_argument("--detail-refresh", type=int, default=int(os.getenv("DETAIL_REFRESH", "60")), help="Successful model polling interval in seconds")
+    parser.add_argument("--detail-request-timeout", type=float, default=float(os.getenv("DETAIL_REQUEST_TIMEOUT", "20")), help="Installer detail request timeout in seconds")
     parser.add_argument("--disconnect-after", type=int, default=int(os.getenv("DISCONNECT_AFTER", "120")), help="Age in seconds before an inverter or PV Link is disconnected")
     parser.add_argument("--pv-inventory-file", default=os.getenv("PV_INVENTORY_FILE", "/data/pv_inventory.json"), help="Persistent learned PV Link inventory")
     parser.add_argument("--pv-inventory-freeze", action="store_true", default=environment_flag("PV_INVENTORY_FREEZE"), help="Do not add newly observed PV Links")
@@ -199,6 +201,8 @@ def validate_arguments(args):
     for name in ("refresh", "detail_refresh", "disconnect_after"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name.replace('_', '-')} must be at least 1")
+    if not math.isfinite(args.detail_request_timeout) or args.detail_request_timeout < 1:
+        raise ValueError("detail-request-timeout must be at least 1")
     if bool(args.user) != bool(args.password):
         raise ValueError("MQTT user and password must be configured together")
     if not args.basetopic.strip("/"):
@@ -292,6 +296,7 @@ def main(argv=None):
         ignored=args.ignore,
         transport=tunnel,
         detail_interval=args.detail_refresh,
+        detail_request_timeout=args.detail_request_timeout,
         disconnect_after=args.disconnect_after,
     )
     monitor = CollectorThread(telemetry, publisher, tunnel, refresh=args.refresh)
