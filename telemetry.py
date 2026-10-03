@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -28,6 +29,10 @@ class InventoryError(ValueError):
 
 class OperatingModeError(RuntimeError):
     """A requested inverter operating-mode change was not confirmed."""
+
+
+class PvLinkControlError(RuntimeError):
+    """A requested PV Link enable change could not be applied safely."""
 
 
 class PvInventory:
@@ -496,6 +501,213 @@ class InstallerTelemetry:
             return self._snapshot(now)
 
     @staticmethod
+    def _directory_integer(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if isinstance(value, float) and (not math.isfinite(value) or value != number):
+            return None
+        return number
+
+    def _pv_link_directory_match_locked(
+        self, serial: str, payload: Any
+    ) -> tuple[str, int, bool]:
+        if not isinstance(serial, str):
+            raise PvLinkControlError(f"PV Link serial {serial!r} is invalid")
+        normalized = serial.upper()
+        if normalized in self.ignored:
+            raise PvLinkControlError(f"PV Link {normalized} is ignored")
+        if not re.fullmatch(r"[0-9A-F]{12}", normalized):
+            raise PvLinkControlError(f"PV Link serial {serial!r} is invalid")
+
+        controllers = [
+            (candidate, device)
+            for candidate, device in self._last_devices.items()
+            if device.get("kind") == "lcm" and self._device_mod_id(device) == 1
+        ]
+        if len(controllers) != 1:
+            raise PvLinkControlError(
+                "exactly one LCM system controller at device ID 1 is required"
+            )
+        now = self.clock()
+        if (
+            self._last_devices_success is None
+            or now - self._last_devices_success > self.disconnect_after
+        ):
+            raise PvLinkControlError("installer device inventory is stale")
+        inverters = [
+            candidate
+            for candidate, candidate_device in self._last_devices.items()
+            if candidate_device.get("kind") == "inverter"
+            and candidate not in self.ignored
+        ]
+        if len(inverters) != 1:
+            raise PvLinkControlError("exactly one current inverter is required")
+        device = self._last_devices.get(normalized)
+        if device is None or device.get("kind") != "pv":
+            raise PvLinkControlError(f"PV Link {normalized} is not currently present")
+        last_seen = device.get("last_seen_at")
+        if (
+            not isinstance(last_seen, (int, float))
+            or now - last_seen > self.disconnect_after
+        ):
+            raise PvLinkControlError(f"PV Link {normalized} is disconnected")
+        unit_id = self._device_mod_id(device)
+        if unit_id is None:
+            raise PvLinkControlError(f"PV Link {normalized} has an invalid device ID")
+
+        repeating = payload.get("repeating") if isinstance(payload, dict) else None
+        if not isinstance(repeating, dict):
+            raise PvLinkControlError("controller device directory is malformed")
+        manufacturer = int(normalized[0:4], 16)
+        device_type = int(normalized[4:8], 16)
+        device_id = int(normalized[8:12], 16)
+        matches: list[tuple[int, bool]] = []
+        for raw_block, entry in repeating.items():
+            try:
+                block = int(raw_block)
+            except (TypeError, ValueError):
+                continue
+            if block <= 0 or str(block) != str(raw_block) or not isinstance(entry, dict):
+                continue
+            identity = (
+                self._directory_integer(entry.get("Man")),
+                self._directory_integer(entry.get("Dev")),
+                self._directory_integer(entry.get("ID")),
+                self._directory_integer(entry.get("UnitID")),
+            )
+            if identity != (manufacturer, device_type, device_id, unit_id):
+                continue
+            enabled = self._directory_integer(entry.get("Ena"))
+            if enabled not in (0, 1):
+                raise PvLinkControlError(
+                    f"controller directory has an invalid Ena value for {normalized}"
+                )
+            matches.append((block, bool(enabled)))
+        if len(matches) != 1:
+            raise PvLinkControlError(
+                f"controller directory has {len(matches)} matches for PV Link {normalized}"
+            )
+        block, enabled = matches[0]
+        return controllers[0][0], block, enabled
+
+    def _pv_link_directory_match(
+        self, serial: str, payload: Any
+    ) -> tuple[str, int, bool]:
+        with self._lock:
+            return self._pv_link_directory_match_locked(serial, payload)
+
+    def _fresh_pv_link_directory_match(
+        self, serial: str, now: float
+    ) -> tuple[int, bool] | None:
+        controllers = [
+            candidate
+            for candidate, device in self._last_devices.items()
+            if device.get("kind") == "lcm" and self._device_mod_id(device) == 1
+        ]
+        if len(controllers) != 1:
+            return None
+        key = (controllers[0], "REbus_dir")
+        health = self._endpoint_health.get(key, {})
+        last_success = health.get("last_success")
+        if last_success is None or now - last_success > self.detail_stale_after:
+            return None
+        try:
+            _, block, enabled = self._pv_link_directory_match_locked(
+                serial, self._details.get(key)
+            )
+        except PvLinkControlError:
+            return None
+        return block, enabled
+
+    def set_pv_link_enabled(self, serial: str, enabled: bool) -> dict[str, Any]:
+        if not isinstance(enabled, bool):
+            raise PvLinkControlError("PV Link enabled state must be boolean")
+        if not isinstance(serial, str):
+            raise PvLinkControlError(f"PV Link serial {serial!r} is invalid")
+        normalized = serial.upper()
+        path = "/device/1/model/REbus_dir/devices"
+        attempts = int(
+            self.operating_mode_confirmation_timeout
+            // self.operating_mode_confirmation_interval
+        ) + 1
+        last_observed: bool | str | None = None
+        confirmed_payload = None
+        controller_serial = None
+        original_block = None
+        try:
+            with self._detail_request_lock:
+                initial = self._get_json(path)
+                controller_serial, original_block, current = (
+                    self._pv_link_directory_match(normalized, initial)
+                )
+                if current == enabled:
+                    confirmed_payload = initial
+                else:
+                    self._post_form(
+                        path,
+                        {f"{original_block}_Ena": "1" if enabled else "0"},
+                    )
+                    for attempt in range(attempts):
+                        try:
+                            readback = self._get_json(path)
+                            current_controller, block, observed = (
+                                self._pv_link_directory_match(normalized, readback)
+                            )
+                            if (
+                                current_controller != controller_serial
+                                or block != original_block
+                            ):
+                                last_observed = "mapping changed"
+                            else:
+                                last_observed = observed
+                                if observed == enabled:
+                                    confirmed_payload = readback
+                                    break
+                        except (
+                            requests.RequestException,
+                            PvLinkControlError,
+                            ValueError,
+                            TypeError,
+                        ) as error:
+                            last_observed = f"error: {error}"
+                        if attempt + 1 < attempts:
+                            self.sleeper(self.operating_mode_confirmation_interval)
+        except PvLinkControlError:
+            raise
+        except (requests.RequestException, ValueError, TypeError) as error:
+            raise PvLinkControlError(f"PV Link request failed: {error}") from error
+
+        if confirmed_payload is None:
+            raise PvLinkControlError(
+                "PV Link state was not confirmed within "
+                f"{self.operating_mode_confirmation_timeout:g} seconds "
+                f"(serial={normalized}, requested={enabled}, "
+                f"last_observed={last_observed!r})"
+            )
+
+        now = self.clock()
+        with self._lock:
+            current_controller, block, observed = self._pv_link_directory_match_locked(
+                normalized, confirmed_payload
+            )
+            if (
+                current_controller != controller_serial
+                or block != original_block
+                or observed != enabled
+            ):
+                raise PvLinkControlError(
+                    "PV Link mapping changed before state confirmation"
+                )
+            self._record_detail_success(
+                (controller_serial, "REbus_dir"), confirmed_payload, now
+            )
+            return self._snapshot_locked(now)
+
+    @staticmethod
     def _kind(group: str, entry: dict[str, Any]) -> str:
         declared = str(entry.get("type", group)).lower()
         if group == "pv" or declared == "pv":
@@ -546,6 +758,8 @@ class InstallerTelemetry:
             return ("common", "REbus_status", "battery", "lithium_ion_string")
         if kind == "pv":
             return ("common", "REbus_status", "pvlink_status", "pvrss_telemetry")
+        if kind == "lcm":
+            return ("REbus_dir",)
         return ()
 
     @staticmethod
@@ -553,6 +767,8 @@ class InstallerTelemetry:
         path = f"/device/{int(mod_id)}/model/{model}"
         if model == "lithium_ion_string":
             path += "/lithium_ion_string_module"
+        elif model == "REbus_dir":
+            path += "/devices"
         return path
 
     def _record_detail_success(
@@ -826,12 +1042,12 @@ class InstallerTelemetry:
         if invalid_rebus_power:
             state.pop("rebus_power_w", None)
         pv = self._fresh_fixed(state, "pvlink_status")
+        directory = self._fresh_pv_link_directory_match(serial, now)
         pvrss = self._fresh_fixed(state, "pvrss_telemetry")
         result = pvrss.get("SelfTestResults")
         result_number = int(result) if isinstance(result, (int, float)) else None
         if pv:
             state.update({
-                "enabled": bool(pv.get("Ena")) if "Ena" in pv else None,
                 "input_voltage_v": _number(pv, "Vin"),
                 "input_current_a": _number(pv, "Iin"),
                 "maximum_current_a": _number(pv, "AMax"),
@@ -840,6 +1056,14 @@ class InstallerTelemetry:
             })
         else:
             state["error_word"] = 0
+        if directory is not None:
+            _, directory_enabled = directory
+            state["enabled"] = directory_enabled
+            state["enable_control_available"] = True
+        else:
+            state["enable_control_available"] = False
+            if pv and "Ena" in pv:
+                state["enabled"] = bool(pv["Ena"])
         if pvrss:
             state.update({
                 "pvrss_status": pvrss.get("Status"),

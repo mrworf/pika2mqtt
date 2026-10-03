@@ -37,6 +37,7 @@ class MqttBridge:
         self.discovery_prefix = discovery_prefix.strip("/")
         self.operating_mode_control_enabled = operating_mode_control_enabled
         self.operating_mode_command_handler = None
+        self.pv_link_command_handler = None
         self.connected = threading.Event()
         self._lock = threading.RLock()
         self._latest: dict[str, Any] | None = None
@@ -78,6 +79,7 @@ class MqttBridge:
         client.subscribe(f"{self.discovery_prefix}/status", qos=self.QOS)
         if self.operating_mode_control_enabled:
             client.subscribe(self._topic("command/system_operating_mode"), qos=self.QOS)
+            client.subscribe(self._topic("command/pv/+/enabled"), qos=self.QOS)
         self._publish(self._topic("availability/service"), "connected")
         self.republish(force_discovery=True)
 
@@ -102,8 +104,18 @@ class MqttBridge:
                 LOG.info("Home Assistant birth received; republishing discovery and state")
                 self.republish(force_discovery=True)
             return
-        if message.topic != self._topic("command/system_operating_mode"):
+        if message.topic == self._topic("command/system_operating_mode"):
+            self._handle_operating_mode_command(message)
             return
+        match = re.fullmatch(
+            re.escape(self._topic("command/pv/"))
+            + r"([0-9A-Fa-f]{12})/enabled",
+            message.topic,
+        )
+        if match:
+            self._handle_pv_link_command(message, match.group(1).upper())
+
+    def _handle_operating_mode_command(self, message) -> None:
         if not self.operating_mode_control_enabled:
             LOG.warning("Ignoring operating mode command while control is disabled")
             return
@@ -125,8 +137,36 @@ class MqttBridge:
         LOG.info("Accepted operating mode command: %s", label)
         self.operating_mode_command_handler(label, code)
 
+    def _handle_pv_link_command(self, message, serial: str) -> None:
+        if not self.operating_mode_control_enabled:
+            LOG.warning("Ignoring PV Link command while control is disabled")
+            return
+        if getattr(message, "retain", False):
+            LOG.warning("Ignoring retained PV Link command for %s", serial)
+            return
+        payload = getattr(message, "payload", None)
+        if payload == b"ON":
+            enabled = True
+        elif payload == b"OFF":
+            enabled = False
+        else:
+            LOG.warning("Ignoring invalid PV Link command for %s: %r", serial, payload)
+            return
+        if self.pv_link_command_handler is None:
+            LOG.error("Cannot process PV Link command: no handler is configured")
+            return
+        LOG.info(
+            "Accepted PV Link command: %s %s",
+            serial,
+            "enabled" if enabled else "disabled",
+        )
+        self.pv_link_command_handler(serial, enabled)
+
     def set_operating_mode_command_handler(self, handler) -> None:
         self.operating_mode_command_handler = handler
+
+    def set_pv_link_command_handler(self, handler) -> None:
+        self.pv_link_command_handler = handler
 
     def wait_connected(self, timeout: float | None = None) -> bool:
         return self.connected.wait(timeout)
@@ -219,6 +259,17 @@ class MqttBridge:
                 self._topic(f"availability/power/pv/{serial}"),
                 "available" if "power_w" in pv else "unavailable",
             )
+            self._publish(
+                self._topic(f"availability/pv/{serial}/enabled"),
+                "available" if pv.get("enabled") is not None else "unavailable",
+            )
+            if self.operating_mode_control_enabled:
+                self._publish(
+                    self._topic(f"availability/control/pv/{serial}"),
+                    "available"
+                    if pv.get("enable_control_available") is True
+                    else "unavailable",
+                )
             self._publish(self._topic(f"state/pv/{serial}"), self._json(pv))
         devices = [snapshot.get("inverter"), *snapshot.get("batteries", [])]
         devices.extend(snapshot.get("pv_links", {}).values())
@@ -557,6 +608,13 @@ class MqttBridge:
         pvlink_availability = self._model_availability(
             measurement_availability, serial, "pvlink_status"
         )
+        enabled_availability = measurement_availability + [
+            {
+                "topic": self._topic(f"availability/pv/{serial}/enabled"),
+                "payload_available": "available",
+                "payload_not_available": "unavailable",
+            }
+        ]
         pvrss_availability = self._model_availability(
             measurement_availability, serial, "pvrss_telemetry"
         )
@@ -576,7 +634,7 @@ class MqttBridge:
             "input_current": self._sensor(child, "input_current_a", "Input current", topic, availability=pvlink_availability, device_class="current", unit_of_measurement="A", state_class="measurement"),
             "energy": self._sensor(child, "accumulated_energy_kwh", "Accumulated energy", topic, availability=rebus_availability, device_class="energy", unit_of_measurement="kWh", state_class="total_increasing"),
             "status": self._sensor(child, "status", "Status", topic, availability=rebus_availability),
-            "enabled": self._binary(child, "enabled", "Enabled", topic, availability=pvlink_availability, entity_category="diagnostic"),
+            "enabled": self._binary(child, "enabled", "Enabled", topic, availability=enabled_availability, entity_category="diagnostic"),
             "last_heard": self._sensor(child, "last_heard_seconds", "Last heard age", topic, availability=connected_availability, device_class="duration", unit_of_measurement="s", state_class="measurement", entity_category="diagnostic"),
             "snaprs_installed": self._sensor(child, "snaprs_installed", "SnapRS installed", topic, availability=pvrss_availability, entity_category="diagnostic"),
             "snaprs_detected": self._sensor(child, "snaprs_detected", "SnapRS detected", topic, availability=pvrss_availability, entity_category="diagnostic"),
@@ -584,6 +642,27 @@ class MqttBridge:
             "error_word": self._sensor(child, "error_word", "Error word", topic, availability=pvlink_availability, entity_category="diagnostic", enabled_by_default=False),
             "status_code": self._sensor(child, "status_code", "Status code", topic, availability=rebus_availability, entity_category="diagnostic", enabled_by_default=False),
         }
+        if self.operating_mode_control_enabled:
+            control_availability = measurement_availability + [
+                {
+                    "topic": self._topic(f"availability/control/pv/{serial}"),
+                    "payload_available": "available",
+                    "payload_not_available": "unavailable",
+                }
+            ]
+            components["enabled_control"] = self._component(
+                "switch",
+                f"{child}_enabled_control",
+                "Enabled Control",
+                topic,
+                "{{ 'ON' if value_json.enabled else 'OFF' }}",
+                control_availability,
+                command_topic=self._topic(f"command/pv/{serial}/enabled"),
+                payload_on="ON",
+                payload_off="OFF",
+                optimistic=False,
+                retain=False,
+            )
         # Every scalar returned by the inverter's model endpoints remains
         # available to Home Assistant without making the default device noisy.
         # Normalized entities above are the stable public interface.

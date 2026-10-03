@@ -46,7 +46,7 @@ def snapshot():
         "inverter": {"serial": "0001000706FA", "power_w": 1000, "accumulated_energy_kwh": 42, "status": "making_power", "system_operating_mode": "Clean Backup"},
         "grid": {"power_w": 500, "import_power_w": 0, "export_power_w": 500, "import_energy_kwh": 2, "export_energy_kwh": 41},
         "batteries": [{"serial": "000100080701", "power_w": -100, "input_power_w": 100, "output_power_w": 0, "state_of_charge_percent": 90.5, "status": "charging_battery"}],
-        "pv_links": {"00010003119C": {"serial": "00010003119C", "connected": True, "fault": False, "power_w": 1200, "status": "making_power", "last_heard_seconds": 2}},
+        "pv_links": {"00010003119C": {"serial": "00010003119C", "connected": True, "fault": False, "power_w": 1200, "status": "making_power", "last_heard_seconds": 2, "enabled": True, "enable_control_available": True}},
     }
 
 
@@ -316,6 +316,10 @@ class MqttBridgeTests(unittest.TestCase):
             ("house/energy/command/system_operating_mode", 1),
             self.client.subscribed,
         )
+        self.assertNotIn(
+            ("house/energy/command/pv/+/enabled", 1),
+            self.client.subscribed,
+        )
 
     def test_enabled_operating_mode_control_discovers_select_and_subscribes(self):
         bridge = MqttBridge(
@@ -328,6 +332,10 @@ class MqttBridgeTests(unittest.TestCase):
         bridge.on_connect(self.client, None, None, 0)
         self.assertIn(
             ("house/energy/command/system_operating_mode", 1),
+            self.client.subscribed,
+        )
+        self.assertIn(
+            ("house/energy/command/pv/+/enabled", 1),
             self.client.subscribed,
         )
         parent = next(
@@ -349,6 +357,96 @@ class MqttBridgeTests(unittest.TestCase):
         self.assertFalse(control["optimistic"])
         self.assertFalse(control["retain"])
         self.assertEqual(control["value_template"], "{{ value_json.system_operating_mode }}")
+        child = next(
+            json.loads(payload)
+            for topic, payload, _, _ in self.client.published
+            if topic == "homeassistant/device/pika2mqtt_pv_00010003119c/config"
+        )
+        pv_control = child["components"]["enabled_control"]
+        self.assertEqual(pv_control["platform"], "switch")
+        self.assertEqual(pv_control["name"], "Enabled Control")
+        self.assertEqual(
+            pv_control["command_topic"],
+            "house/energy/command/pv/00010003119C/enabled",
+        )
+        self.assertEqual(pv_control["payload_on"], "ON")
+        self.assertEqual(pv_control["payload_off"], "OFF")
+        self.assertFalse(pv_control["optimistic"])
+        self.assertFalse(pv_control["retain"])
+        self.assertEqual(
+            pv_control["availability"][-1]["topic"],
+            "house/energy/availability/control/pv/00010003119C",
+        )
+
+    def test_pv_link_commands_validate_and_dispatch_exact_payloads(self):
+        calls = []
+        bridge = MqttBridge(
+            self.client,
+            "house/energy",
+            "inverter.local",
+            operating_mode_control_enabled=True,
+        )
+        bridge.set_pv_link_command_handler(
+            lambda serial, enabled: calls.append((serial, enabled))
+        )
+        topic = "house/energy/command/pv/00010003119c/enabled"
+        for payload, enabled in ((b"ON", True), (b"OFF", False)):
+            bridge.on_message(
+                self.client,
+                None,
+                types.SimpleNamespace(topic=topic, payload=payload, retain=False),
+            )
+            self.assertEqual(calls[-1], ("00010003119C", enabled))
+
+        count = len(calls)
+        with self.assertLogs("mqtt_bridge", level="WARNING"):
+            for payload, retained in ((b"on", False), (b" ON", False), (b"ON", True)):
+                bridge.on_message(
+                    self.client,
+                    None,
+                    types.SimpleNamespace(
+                        topic=topic,
+                        payload=payload,
+                        retain=retained,
+                    ),
+                )
+        self.assertEqual(len(calls), count)
+
+    def test_disabled_pv_link_control_ignores_direct_command(self):
+        calls = []
+        self.bridge.set_pv_link_command_handler(lambda *args: calls.append(args))
+        with self.assertLogs("mqtt_bridge", level="WARNING"):
+            self.bridge.on_message(
+                self.client,
+                None,
+                types.SimpleNamespace(
+                    topic="house/energy/command/pv/00010003119C/enabled",
+                    payload=b"OFF",
+                    retain=False,
+                ),
+            )
+        self.assertEqual(calls, [])
+
+    def test_pv_control_and_enabled_availability_publish_independently(self):
+        bridge = MqttBridge(
+            self.client,
+            "house/energy",
+            "inverter.local",
+            operating_mode_control_enabled=True,
+        )
+        data = snapshot()
+        data["pv_links"]["00010003119C"]["enable_control_available"] = False
+        bridge.publish_snapshot(data)
+        bridge.on_connect(self.client, None, None, 0)
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        self.assertIn(
+            ("house/energy/availability/pv/00010003119C/enabled", "available"),
+            values,
+        )
+        self.assertIn(
+            ("house/energy/availability/control/pv/00010003119C", "unavailable"),
+            values,
+        )
 
     def test_operating_mode_commands_validate_and_dispatch_exact_options(self):
         calls = []
@@ -456,7 +554,7 @@ class MqttBridgeTests(unittest.TestCase):
         status_topics = {item["topic"] for item in components["status"]["availability"]}
         fault_topics = {item["topic"] for item in components["fault"]["availability"]}
         self.assertIn(
-            "house/energy/availability/model/00010003119C/pvlink_status",
+            "house/energy/availability/pv/00010003119C/enabled",
             enabled_topics,
         )
         self.assertNotIn(

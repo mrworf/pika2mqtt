@@ -11,7 +11,13 @@ import time
 
 from mqtt_bridge import MqttBridge, stable_id
 from pika_transport import SshTunnelConfig, SshTunnelSupervisor, TransportConfigurationError
-from telemetry import InstallerTelemetry, InventoryError, OperatingModeError, PvInventory
+from telemetry import (
+    InstallerTelemetry,
+    InventoryError,
+    OperatingModeError,
+    PvInventory,
+    PvLinkControlError,
+)
 from web_gateway import GatewayConfigurationError, InstallerWebGateway, WebGatewayConfig, resolve_web_password
 
 
@@ -38,6 +44,7 @@ class CollectorThread(threading.Thread):
         self._wake_event = threading.Event()
         self._command_lock = threading.Lock()
         self._pending_operating_mode = None
+        self._pending_pv_link_commands = {}
 
     def stop(self):
         self.stop_event.set()
@@ -80,6 +87,49 @@ class CollectorThread(threading.Thread):
         logging.info("Operating mode command confirmed: %s", label)
         return True
 
+    def request_pv_link_enabled(self, serial, enabled):
+        with self._command_lock:
+            previous = self._pending_pv_link_commands.get(serial)
+            self._pending_pv_link_commands[serial] = enabled
+        if previous is not None:
+            logging.info(
+                "Replacing pending PV Link command for %s (%s -> %s)",
+                serial,
+                "enabled" if previous else "disabled",
+                "enabled" if enabled else "disabled",
+            )
+        self._wake_event.set()
+
+    def _take_pending_pv_link_command(self):
+        with self._command_lock:
+            if not self._pending_pv_link_commands:
+                return None
+            serial = next(iter(self._pending_pv_link_commands))
+            enabled = self._pending_pv_link_commands.pop(serial)
+        return serial, enabled
+
+    def _process_pending_pv_link_command(self):
+        command = self._take_pending_pv_link_command()
+        if command is None:
+            return False
+        serial, enabled = command
+        label = "enable" if enabled else "disable"
+        if not self.transport.wait_available(timeout=0):
+            logging.error(
+                "PV Link command %s %s failed: SSH tunnel is unavailable",
+                label,
+                serial,
+            )
+            return False
+        try:
+            snapshot = self.telemetry.set_pv_link_enabled(serial, enabled)
+        except PvLinkControlError as error:
+            logging.error("PV Link command %s %s failed: %s", label, serial, error)
+            return False
+        self.publisher.publish_snapshot(snapshot)
+        logging.info("PV Link command confirmed: %s %s", label, serial)
+        return True
+
     def run(self):
         logging.info("Starting the telemetry monitor")
         next_poll = 0.0
@@ -87,6 +137,7 @@ class CollectorThread(threading.Thread):
             if not self.publisher.wait_connected(timeout=1):
                 continue
             self._process_pending_operating_mode()
+            self._process_pending_pv_link_command()
             if time.monotonic() >= next_poll:
                 if self.transport.wait_available(timeout=1):
                     snapshot = self.telemetry.poll_primary()
@@ -245,6 +296,7 @@ def main(argv=None):
     )
     monitor = CollectorThread(telemetry, publisher, tunnel, refresh=args.refresh)
     publisher.set_operating_mode_command_handler(monitor.request_operating_mode)
+    publisher.set_pv_link_command_handler(monitor.request_pv_link_enabled)
     stop_event = threading.Event()
 
     def shutdown(signum=None, frame=None):

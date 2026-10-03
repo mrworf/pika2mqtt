@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from telemetry import (
     InventoryError,
     OperatingModeError,
     PvInventory,
+    PvLinkControlError,
     decode_rebus_state,
     decode_system_operating_mode,
 )
@@ -24,6 +26,43 @@ class Response:
 
     def json(self):
         return self.payload
+
+
+class FakePvDirectoryInstaller:
+    """Mirror the installer UI: bad form fields still receive HTTP success."""
+
+    PATH = "/device/1/model/REbus_dir/devices"
+
+    def __init__(self, block="2", enabled=1, unit_id=3):
+        self.block = str(block)
+        self.payload = {
+            "fixed": {},
+            "repeating": {
+                self.block: {
+                    "Man": 1,
+                    "Dev": 3,
+                    "ID": 1,
+                    "UnitID": unit_id,
+                    "Ena": enabled,
+                }
+            },
+        }
+        self.posts = []
+
+    def get(self):
+        return copy.deepcopy(self.payload)
+
+    def post(self, url, data, timeout):
+        self.posts.append((url, dict(data), timeout))
+        expected_url = f"http://installer{self.PATH}"
+        expected_key = f"{self.block}_Ena"
+        if (
+            url == expected_url
+            and set(data) == {expected_key}
+            and data[expected_key] in ("0", "1")
+        ):
+            self.payload["repeating"][self.block]["Ena"] = int(data[expected_key])
+        return Response(status=200)
 
 
 class InventoryTests(unittest.TestCase):
@@ -696,6 +735,236 @@ class TelemetryTests(unittest.TestCase):
             collector.poll()
             with self.assertRaisesRegex(OperatingModeError, "HTTP 500"):
                 collector.set_system_operating_mode(2)
+
+    def test_pv_link_enable_and_disable_use_verified_repeating_block_field(self):
+        for initial, requested in ((0, True), (1, False)):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as directory:
+                installer = FakePvDirectoryInstaller(block="4", enabled=initial)
+                routes = {
+                    "/devices": self.fixture("devices.json"),
+                    installer.PATH: installer.get,
+                }
+                collector = self.collector(
+                    directory,
+                    routes,
+                    request_post=installer.post,
+                    sleeper=lambda seconds: self.fail("unexpected confirmation wait"),
+                )
+                collector.poll()
+
+                snapshot = collector.set_pv_link_enabled(
+                    "000100030001", requested
+                )
+
+                self.assertEqual(
+                    installer.posts,
+                    [
+                        (
+                            f"http://installer{installer.PATH}",
+                            {"4_Ena": "1" if requested else "0"},
+                            5,
+                        )
+                    ],
+                )
+                pv = snapshot["pv_links"]["000100030001"]
+                self.assertEqual(pv["enabled"], requested)
+                self.assertTrue(pv["enable_control_available"])
+
+    def test_pv_link_already_in_requested_state_is_a_write_free_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installer = FakePvDirectoryInstaller(enabled=1)
+            collector = self.collector(
+                directory,
+                {
+                    "/devices": self.fixture("devices.json"),
+                    installer.PATH: installer.get,
+                },
+                request_post=installer.post,
+            )
+            collector.poll()
+
+            snapshot = collector.set_pv_link_enabled("000100030001", True)
+
+            self.assertEqual(installer.posts, [])
+            self.assertTrue(snapshot["pv_links"]["000100030001"]["enabled"])
+
+    def test_fake_pv_installer_silently_ignores_wrong_fields_routes_and_indexes(self):
+        installer = FakePvDirectoryInstaller(block="6", enabled=0)
+        bad_requests = (
+            (f"http://installer{installer.PATH}", {"Ena": "1"}),
+            (f"http://installer{installer.PATH}", {"0_Ena": "1"}),
+            (f"http://installer{installer.PATH}", {"2_Ena": "1"}),
+            ("http://installer/device/1/model/REbus_dir", {"6_Ena": "1"}),
+        )
+        for url, data in bad_requests:
+            self.assertEqual(installer.post(url, data, 5).status_code, 200)
+            self.assertEqual(installer.get()["repeating"]["6"]["Ena"], 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            collector = self.collector(
+                directory,
+                {
+                    "/devices": self.fixture("devices.json"),
+                    installer.PATH: installer.get,
+                },
+                request_post=installer.post,
+            )
+            collector.poll()
+            collector.set_pv_link_enabled("000100030001", True)
+        self.assertEqual(installer.posts[-1][1], {"6_Ena": "1"})
+        self.assertEqual(installer.get()["repeating"]["6"]["Ena"], 1)
+
+    def test_pv_link_control_rejects_missing_ambiguous_and_stale_mappings(self):
+        cases = {}
+        missing = FakePvDirectoryInstaller().get()
+        missing["repeating"] = {}
+        cases["0 matches"] = missing
+        ambiguous = FakePvDirectoryInstaller().get()
+        ambiguous["repeating"]["3"] = dict(ambiguous["repeating"]["2"])
+        cases["2 matches"] = ambiguous
+        stale = FakePvDirectoryInstaller(unit_id=99).get()
+        cases["0 matches-stale-unit"] = stale
+        malformed = FakePvDirectoryInstaller().get()
+        malformed["repeating"]["2"]["Ena"] = 7
+        cases["invalid Ena"] = malformed
+
+        for expected, payload in cases.items():
+            with self.subTest(case=expected), tempfile.TemporaryDirectory() as directory:
+                posts = []
+                collector = self.collector(
+                    directory,
+                    {
+                        "/devices": self.fixture("devices.json"),
+                        FakePvDirectoryInstaller.PATH: payload,
+                    },
+                    request_post=lambda *args, **kwargs: posts.append((args, kwargs)),
+                )
+                collector.poll()
+                with self.assertRaises(PvLinkControlError) as raised:
+                    collector.set_pv_link_enabled("000100030001", False)
+                self.assertIn(expected.split("-")[0], str(raised.exception))
+                self.assertEqual(posts, [])
+
+    def test_pv_link_confirmation_waits_and_timeout_preserves_cached_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installer = FakePvDirectoryInstaller(enabled=0)
+            command_sent = [False]
+            reads = [0]
+            sleeps = []
+
+            def delayed_directory():
+                payload = installer.get()
+                if command_sent[0]:
+                    reads[0] += 1
+                    if reads[0] < 3:
+                        payload["repeating"][installer.block]["Ena"] = 0
+                return payload
+
+            def post(url, data, timeout):
+                command_sent[0] = True
+                return installer.post(url, data, timeout)
+
+            collector = self.collector(
+                directory,
+                {
+                    "/devices": self.fixture("devices.json"),
+                    installer.PATH: delayed_directory,
+                },
+                request_post=post,
+                sleeper=sleeps.append,
+            )
+            collector.poll()
+            snapshot = collector.set_pv_link_enabled("000100030001", True)
+            self.assertEqual(sleeps, [5.0, 5.0])
+            self.assertTrue(snapshot["pv_links"]["000100030001"]["enabled"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            unchanged = FakePvDirectoryInstaller(enabled=1)
+            sleeps = []
+            posts = []
+
+            def ignored_post(url, data, timeout):
+                posts.append((url, data, timeout))
+                return Response(status=200)
+
+            collector = self.collector(
+                directory,
+                {
+                    "/devices": self.fixture("devices.json"),
+                    unchanged.PATH: unchanged.get,
+                },
+                request_post=ignored_post,
+                sleeper=sleeps.append,
+            )
+            before = collector.poll()
+            with self.assertRaisesRegex(
+                PvLinkControlError,
+                r"not confirmed within 30 seconds.*last_observed=True",
+            ):
+                collector.set_pv_link_enabled("000100030001", False)
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(sleeps, [5.0] * 6)
+            after = collector.current_snapshot()
+            self.assertEqual(
+                after["pv_links"]["000100030001"]["enabled"],
+                before["pv_links"]["000100030001"]["enabled"],
+            )
+
+    def test_pv_link_mapping_change_cannot_confirm_a_stale_write_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            before = FakePvDirectoryInstaller(block="2", enabled=0)
+            after = FakePvDirectoryInstaller(block="3", enabled=1)
+            command_sent = [False]
+            posts = []
+
+            def directory_payload():
+                return after.get() if command_sent[0] else before.get()
+
+            def post(url, data, timeout):
+                posts.append((url, data, timeout))
+                command_sent[0] = True
+                return Response(status=200)
+
+            collector = self.collector(
+                directory,
+                {
+                    "/devices": self.fixture("devices.json"),
+                    before.PATH: directory_payload,
+                },
+                request_post=post,
+                operating_mode_confirmation_timeout=0,
+            )
+            collector.poll()
+            with self.assertRaisesRegex(PvLinkControlError, "mapping changed"):
+                collector.set_pv_link_enabled("000100030001", True)
+            self.assertEqual(posts[0][1], {"2_Ena": "1"})
+            self.assertEqual(len(posts), 1)
+
+    def test_pv_enabled_prefers_fresh_directory_and_falls_back_to_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1000]
+            installer = FakePvDirectoryInstaller(enabled=0)
+            routes = {
+                "/devices": self.fixture("devices.json"),
+                installer.PATH: installer.get,
+                "/device/3/model/pvlink_status": {"fixed": {"Ena": 1}},
+            }
+            collector = self.collector(
+                directory,
+                routes,
+                detail_stale_after=120,
+            )
+            collector.clock = lambda: now[0]
+            fresh = collector.poll()["pv_links"]["000100030001"]
+            self.assertFalse(fresh["enabled"])
+            self.assertTrue(fresh["enable_control_available"])
+
+            collector._endpoint_health[("000100120001", "REbus_dir")][
+                "last_success"
+            ] = 879
+            stale = collector.current_snapshot()["pv_links"]["000100030001"]
+            self.assertTrue(stale["enabled"])
+            self.assertFalse(stale["enable_control_available"])
 
     def test_model_failure_backs_off_without_disconnect(self):
         with tempfile.TemporaryDirectory() as directory:

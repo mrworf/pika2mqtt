@@ -3,7 +3,7 @@ import unittest
 from unittest import mock
 
 from pika2mqtt import CollectorThread, build_parser, validate_arguments
-from telemetry import OperatingModeError
+from telemetry import OperatingModeError, PvLinkControlError
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -110,6 +110,49 @@ class CollectorCommandTests(unittest.TestCase):
         failed.request_operating_mode("Self Supply", 2)
         with self.assertLogs(level="ERROR"):
             self.assertFalse(failed._process_pending_operating_mode())
+        self.assertEqual(publisher.snapshots, [])
+
+    def test_pending_pv_link_commands_coalesce_per_link_and_preserve_order(self):
+        telemetry = mock.Mock()
+        telemetry.set_pv_link_enabled.side_effect = [
+            {"serial": "000100030001", "enabled": False},
+            {"serial": "000100030002", "enabled": True},
+        ]
+        publisher = self.Publisher()
+        monitor = CollectorThread(telemetry, publisher, self.Transport())
+
+        monitor.request_pv_link_enabled("000100030001", True)
+        monitor.request_pv_link_enabled("000100030002", True)
+        monitor.request_pv_link_enabled("000100030001", False)
+
+        self.assertTrue(monitor._process_pending_pv_link_command())
+        self.assertTrue(monitor._process_pending_pv_link_command())
+        self.assertFalse(monitor._process_pending_pv_link_command())
+        self.assertEqual(
+            telemetry.set_pv_link_enabled.call_args_list,
+            [
+                mock.call("000100030001", False),
+                mock.call("000100030002", True),
+            ],
+        )
+        self.assertEqual(len(publisher.snapshots), 2)
+
+    def test_failed_or_unavailable_pv_link_command_does_not_publish(self):
+        telemetry = mock.Mock()
+        publisher = self.Publisher()
+        unavailable = CollectorThread(telemetry, publisher, self.Transport(False))
+        unavailable.request_pv_link_enabled("000100030001", False)
+        with self.assertLogs(level="ERROR"):
+            self.assertFalse(unavailable._process_pending_pv_link_command())
+        telemetry.set_pv_link_enabled.assert_not_called()
+
+        telemetry.set_pv_link_enabled.side_effect = PvLinkControlError(
+            "mocked failure"
+        )
+        failed = CollectorThread(telemetry, publisher, self.Transport(True))
+        failed.request_pv_link_enabled("000100030001", False)
+        with self.assertLogs(level="ERROR"):
+            self.assertFalse(failed._process_pending_pv_link_command())
         self.assertEqual(publisher.snapshots, [])
 
 

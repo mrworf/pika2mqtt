@@ -85,6 +85,12 @@ The `HOSTNAME`, `MQTT`, `MQTT_USER`, `MQTT_PASSWORD`, `BASETOPIC`, `IGNORE`,
 and `/key/id_rsa` interfaces remain available. Transport and persistent-state
 requirements are:
 
+If an existing deployment already sets `OPERATING_MODE_CONTROL_ENABLED=true`,
+upgrading also exposes an `Enabled Control` switch for every PV Link. Review
+MQTT ACLs and Home Assistant user permissions before upgrading, or set the flag
+to `false` until PV Link control is desired. The read-only Enabled entity and
+all existing state topics remain compatible.
+
 - The SSH private key is now mandatory and should be mounted read-only.
 - `SSH_HOST_FINGERPRINT` is mandatory.
 - The Docker host must reach the inverter on TCP/22.
@@ -282,7 +288,7 @@ file is preferred. The file takes precedence if both are set.
 | `PV_INVENTORY_FREEZE` | `false` | Prevent newly observed PV Links from being learned |
 | `HA_DISCOVERY_ENABLED` | `true` | Publish Home Assistant MQTT device discovery |
 | `HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant discovery prefix |
-| `OPERATING_MODE_CONTROL_ENABLED` | `false` | Allow the approved operating modes to be selected through MQTT |
+| `OPERATING_MODE_CONTROL_ENABLED` | `false` | Allow approved operating-mode and PV Link enable controls through MQTT |
 | `WEB_ENABLED` | `false` | Start the authenticated web gateway |
 | `WEB_WRITE_ENABLED` | `false` | Forward methods other than GET/HEAD/OPTIONS |
 | `WEB_LISTEN` | `0.0.0.0` | Gateway address inside the container |
@@ -316,10 +322,11 @@ house/energy/state/battery/000100080701/module/1
 house/energy/state/pv/00010003119C
 ```
 
-When operating mode control is explicitly enabled, commands use:
+When control is explicitly enabled, commands use:
 
 ```text
 house/energy/command/system_operating_mode
+house/energy/command/pv/00010003119C/enabled
 ```
 
 Availability uses:
@@ -328,6 +335,8 @@ Availability uses:
 house/energy/availability/service
 house/energy/availability/inverter
 house/energy/availability/pv/00010003119C
+house/energy/availability/pv/00010003119C/enabled
+house/energy/availability/control/pv/00010003119C
 house/energy/availability/battery/000100080701/modules
 house/energy/availability/battery/000100080701/module/1
 house/energy/availability/power/solar
@@ -362,10 +371,11 @@ are not republished. If the model reports an expected module number without a
 corresponding record, that child remains visible but unavailable, making a
 missing module distinguishable from a module that was never discovered.
 
-### Optional operating mode control
+### Optional operating mode and PV Link control
 
-Operating mode control is disabled by default. To add a separate Home
-Assistant `System Operating Mode Control` selector, set:
+All write controls are disabled by default. To add a separate Home Assistant
+`System Operating Mode Control` selector and an `Enabled Control` switch to
+each PV Link, set:
 
 ```yaml
 environment:
@@ -376,6 +386,27 @@ The selector permits only `Grid Tie`, `Self Supply`, `Clean Backup`, and
 `Priority Backup`. Safety Shutdown, Remote Arbitrage, and Sell remain readable
 but cannot be commanded through pika2mqtt. The existing read-only System
 Operating Mode sensor remains available for dashboards and automations.
+
+Each PV Link switch sends an exact, non-retained `ON` or `OFF` command. The
+existing read-only `Enabled` binary sensor is unchanged. It prefers the
+controller's fresh device-directory state and falls back to `pvlink_status`
+when the directory is unavailable; the control switch itself becomes
+unavailable unless the service, inverter, PV Link, and authoritative directory
+mapping are all available.
+
+pika2mqtt does not assume that a PV Link's Modbus ID is its writable directory
+block. Before every command it reads `/device/1/model/REbus_dir/devices` and
+requires one exact match using the current Modbus unit ID plus the manufacturer,
+device type, and device ID encoded in the 12-hex RCP serial. An already-matching
+state is a write-free no-op. Otherwise pika2mqtt sends one form POST to that
+same repeating-block route using the verified one-based `<block>_Ena` field
+with value `1` or `0`. It does not retry the write.
+
+After a write, the directory is read immediately and every five seconds for up
+to 30 seconds. The identity is re-resolved each time, and the new state is
+published only after the same mapping reports the requested value. Missing,
+stale, malformed, changed, or ambiguous mappings are rejected and logged;
+failure preserves the last confirmed state.
 
 Home Assistant sends a non-retained command and pika2mqtt rejects any retained
 command received on the topic. The displayed selection is not changed
@@ -392,13 +423,15 @@ therefore appear successful briefly or be silently ignored. Do not use
 operating-mode automation with an affected image; pull and recreate the
 container with the corrected image first.
 
-Anyone who can publish to the command topic can request a mode change. Use MQTT
+Anyone who can publish to a command topic can change system behavior. Use MQTT
 broker ACLs so only the intended Home Assistant account can publish to
-`house/energy/command/system_operating_mode`; other consumers should receive
-read-only access.
+`house/energy/command/system_operating_mode` and
+`house/energy/command/pv/+/enabled`; other consumers should receive read-only
+access.
 
-Actual mode changes are intentionally not exercised by the automated tests.
-After enabling the feature, the system owner should manually verify it:
+Actual mode or PV Link changes are intentionally not exercised against a live
+inverter by the automated tests. After enabling the feature, the system owner
+should manually verify operating-mode control as follows:
 
 1. Record the current mode and watch `docker logs -f pika2mqtt`.
 2. Select one of the four approved modes in Home Assistant.
@@ -411,6 +444,12 @@ After enabling the feature, the system owner should manually verify it:
 Do this only when changing the inverter mode is operationally safe. The MQTT
 control flag is independent of `WEB_WRITE_ENABLED`; the installer web gateway
 does not need to be exposed or write-enabled.
+
+Verify each PV Link switch separately during safe daylight and load conditions:
+watch the container log, toggle only the intended string, confirm both the
+installer interface and the read-only Enabled entity agree, then restore the
+desired state before proceeding to another string. Do not send commands to all
+strings at once during initial validation.
 
 Power uses watts, battery charge uses percent, and energy uses kWh. Positive
 grid power means export and positive battery power means discharge; separate
@@ -446,9 +485,10 @@ and failed PVRSS self-tests. The system device provides separate aggregate
 “any string disconnected” and “any string faulted” binary sensors for alerting.
 
 The collector follows the endpoint contract used by the installer UI:
-`/devices`; inverter `common`, `REbus_status`, `inverter_status`, `REbus_exp`,
-and `inverter`; battery `common`, `REbus_status`, and `battery`; and PV Link
-`common`, `REbus_status`, `pvlink_status`, and `pvrss_telemetry`. Detailed model
+`/devices`; controller `REbus_dir/devices`; inverter `common`, `REbus_status`,
+`inverter_status`, `REbus_exp`, and `inverter`; battery `common`, `REbus_status`,
+and `battery`; and PV Link `common`, `REbus_status`, `pvlink_status`, and
+`pvrss_telemetry`. Detailed model
 requests run serially in a separate worker with a persistent HTTP session, so a
 slow or hung model cannot delay `/devices` polling. Requests are spaced rather
 than sent as one synchronized burst. Detailed model errors are logged and
