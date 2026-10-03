@@ -237,6 +237,35 @@ class GatewayTestCase(unittest.TestCase):
         self.assertLess(results["fast"][1], results["slow"][1])
 
 
+    def test_reference_routes_authentication_read_only_and_offline_access(self):
+        from tests.test_register_definitions import definitions
+        gateway = self.start_gateway(allow_writes=True)
+        gateway.definitions = definitions()
+        gateway.transport.available = False
+        status, _, _ = self.request(gateway, path="/diagnostics/registers")
+        self.assertEqual(status, 401)
+        status, headers, body = self.request(gateway, path="/diagnostics/registers", headers=self.authorization())
+        self.assertEqual(status, 200)
+        self.assertIn(b"Firmware register reference", body)
+        self.assertIn("text/html", headers["Content-Type"])
+        status, headers, body = self.request(gateway, path="/diagnostics/registers.md", headers=self.authorization())
+        self.assertEqual(status, 200)
+        self.assertIn(b"HW_ARC_FAULT", body)
+        self.assertIn("attachment", headers["Content-Disposition"])
+        status, _, body = self.request(gateway, method="HEAD", path="/diagnostics/registers.md", headers=self.authorization())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        status, _, _ = self.request(gateway, method="POST", path="/diagnostics/registers", headers=self.authorization())
+        self.assertEqual(status, 405)
+        self.assertEqual(FakeInstallerHandler.requests, [])
+
+    def test_reference_before_definitions_load_returns_clear_error(self):
+        gateway = self.start_gateway()
+        status, _, body = self.request(gateway, path="/diagnostics/registers", headers=self.authorization())
+        self.assertEqual(status, 503)
+        self.assertIn(b"not loaded", body)
+
+
 class GatewayConfigurationTests(unittest.TestCase):
     def test_gateway_is_disabled_without_creating_listener(self):
         gateway = InstallerWebGateway(WebGatewayConfig(), FakeTransport())

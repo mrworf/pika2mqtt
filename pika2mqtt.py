@@ -11,6 +11,7 @@ import threading
 import time
 
 from mqtt_bridge import MqttBridge, stable_id
+from register_definitions import RegisterDefinitions
 from pika_transport import SshTunnelConfig, SshTunnelSupervisor, TransportConfigurationError
 from telemetry import (
     InstallerTelemetry,
@@ -173,6 +174,7 @@ def build_parser():
     parser.add_argument("--disconnect-after", type=int, default=int(os.getenv("DISCONNECT_AFTER", "120")), help="Age in seconds before an inverter or PV Link is disconnected")
     parser.add_argument("--pv-inventory-file", default=os.getenv("PV_INVENTORY_FILE", "/data/pv_inventory.json"), help="Persistent learned PV Link inventory")
     parser.add_argument("--pv-inventory-freeze", action="store_true", default=environment_flag("PV_INVENTORY_FREEZE"), help="Do not add newly observed PV Links")
+    parser.add_argument("--register-policy-file", default=os.getenv("REGISTER_POLICY_FILE") or None, help="Complete symbol-based register classification policy override")
     discovery = parser.add_mutually_exclusive_group()
     discovery.add_argument("--ha-discovery", dest="ha_discovery", action="store_true")
     discovery.add_argument("--no-ha-discovery", dest="ha_discovery", action="store_false")
@@ -262,13 +264,19 @@ def main(argv=None):
         ssh_port=args.ssh_port,
         local_port=args.ssh_local_port,
     ))
+    data_directory = os.path.dirname(os.path.abspath(args.pv_inventory_file))
+    try:
+        definitions = RegisterDefinitions(tunnel, args.register_policy_file, data_directory)
+    except ValueError as error:
+        logging.critical("%s", error)
+        return 2
     try:
         tunnel.start()
     except TransportConfigurationError as error:
         logging.critical("%s", error)
         return 2
 
-    gateway = InstallerWebGateway(web_config, tunnel)
+    gateway = InstallerWebGateway(web_config, tunnel, definitions=definitions)
     try:
         gateway.start()
     except GatewayConfigurationError as error:
@@ -289,6 +297,7 @@ def main(argv=None):
         discovery_enabled=args.ha_discovery,
         discovery_prefix=args.ha_discovery_prefix,
         operating_mode_control_enabled=args.operating_mode_control,
+        diagnostic_manifest_file=os.path.join(data_directory, "register_discovery.json"),
     )
     telemetry = InstallerTelemetry(
         tunnel.base_url,
@@ -298,6 +307,7 @@ def main(argv=None):
         detail_interval=args.detail_refresh,
         detail_request_timeout=args.detail_request_timeout,
         disconnect_after=args.disconnect_after,
+        definitions=definitions,
     )
     monitor = CollectorThread(telemetry, publisher, tunnel, refresh=args.refresh)
     publisher.set_operating_mode_command_handler(monitor.request_operating_mode)
@@ -318,6 +328,7 @@ def main(argv=None):
         logging.info("Connecting to MQTT broker %s:%d as %s", args.mqtt, args.mqtt_port, client_id)
         client.connect_async(args.mqtt, args.mqtt_port, 60)
         client.loop_start()
+        definitions.start()
         telemetry.start_detail_worker()
         monitor.start()
         while not stop_event.wait(0.5):
@@ -331,6 +342,7 @@ def main(argv=None):
         if monitor.is_alive():
             monitor.join(timeout=10)
         telemetry.stop_detail_worker()
+        definitions.stop()
         publisher.shutdown()
         client.loop_stop()
         gateway.stop()

@@ -1,0 +1,29 @@
+<sunSpecModels v="1">
+  <!-- Minimal test definitions. Values mirror the observed firmware; synthetic
+       changes in tests verify that production never assumes these numbers. -->
+  <model id="64207" name="REbus_status"><block>
+    <point id="St" type="enum16"><symbol id="UNKNOWN">0</symbol><symbol id="DISABLED">16</symbol><symbol id="STANDBY">768</symbol><symbol id="GRID_CONNECTED">2080</symbol><symbol id="MAKING_POWER">8208</symbol><symbol id="GROUND_FAULT">16384</symbol><symbol id="OVER_VOLTAGE_INPUT">28688</symbol></point>
+    <point id="Ev" type="enum16"><symbol id="GENERIC">32768</symbol><symbol id="SYSMODE_CHANGE">33536</symbol><symbol id="DAILY_EVENT">32816</symbol></point>
+    <point id="RB" type="bitfield16"><symbol id="ENABLE_MASTER">0</symbol><symbol id="ENABLE_SOURCE">1</symbol><symbol id="ENABLE_SINK">2</symbol><symbol id="RESERVED3">3</symbol><symbol id="HEARTBEAT_GOOD">13</symbol></point>
+  </block></model>
+  <strings id="64207" locale="en"><point id="St"><label>Status</label><description>Current device state.</description></point><point id="Ev"><label>Last event</label><description>Most recent event.</description></point></strings>
+  <model id="64200" name="REbus_dir"><block type="repeating">
+    <point id="St" type="enum16"><symbol id="UNKNOWN">0</symbol><symbol id="DISABLED">16</symbol><symbol id="MAKING_POWER">8208</symbol><symbol id="GROUND_FAULT">16384</symbol><symbol id="OVER_VOLTAGE_INPUT">28688</symbol></point>
+    <point id="Rb" type="uint16"><symbol id="ENABLE_MASTER">0</symbol><symbol id="HEARTBEAT_GOOD">13</symbol></point>
+  </block></model>
+  <model id="64211" name="pvlink_status"><block>
+    <point id="ErrorWord" type="bitfield16"><symbol id="UNUSED0">0</symbol><symbol id="HW_ARC_FAULT">1</symbol><symbol id="HW_REVERSE_CURRENT">2</symbol><symbol id="OVER_CURRENT">3</symbol><symbol id="INPUT_OVERVOLTAGE">4</symbol><symbol id="GFTEST_FAIL">5</symbol><symbol id="LOW_INPUT_IMPEDANCE">6</symbol><symbol id="UNUSED7">7</symbol><symbol id="UNUSED8">8</symbol><symbol id="FLASH_FAILURE">9</symbol><symbol id="EEPROM_FAILURE">10</symbol><symbol id="SPT_CRC_FAIL">11</symbol><symbol id="OVER_TEMP">12</symbol><symbol id="UNUSED13">13</symbol><symbol id="DEAD_FET">14</symbol><symbol id="HWV_MISMATCH">15</symbol></point>
+    <point id="StatusWord" type="bitfield16"><symbol id="DEADMAN_UP">0</symbol><symbol id="LOW_SUPPLY_VOLTAGE">1</symbol></point>
+  </block></model>
+  <model id="64264" name="pvrss_telemetry"><block>
+    <point id="Status" type="bitfield16"><symbol id="INSTALLED_COUNT_IS_LOCKED">0</symbol><symbol id="LOCKOUT_ERROR">1</symbol></point>
+    <point id="SelfTestResults" type="enum16"><symbol id="SUCCESS">0</symbol><symbol id="VOC_LOW">1</symbol><symbol id="NONE">2</symbol><symbol id="VLOW_HIGH">3</symbol><symbol id="COUNT_MISMATCH">4</symbol></point>
+  </block></model>
+  <model id="64208" name="inverter_status"><block>
+    <point id="ErrorWord" type="bitfield16"><symbol id="LINE1_OVERCURRENT">0</symbol><symbol id="AC_PRECHARGE_FAIL">1</symbol></point>
+    <point id="StatusWord" type="bitfield16"><symbol id="V1_LOCKED">0</symbol><symbol id="ESTOP_ACTIVE">9</symbol></point>
+  </block></model>
+  <model id="804" name="lithium_ion_string"><block type="repeating">
+    <point id="Evt" type="bitfield32"><symbol id="TEST_MODULE_FAULT">4</symbol></point>
+  </block></model>
+</sunSpecModels>

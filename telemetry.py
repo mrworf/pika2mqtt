@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
+from register_definitions import RegisterDefinitions
 
 
 LOG = logging.getLogger(__name__)
@@ -119,73 +120,6 @@ class PvInventory:
             raise InventoryError(f"cannot write PV inventory {self.path}: {error}") from error
 
 
-REBUS_STATES = {
-    0x0000: ("unknown", "unknown"),
-    0x0010: ("disabled", "disabled"),
-    0x0020: ("emergency_stop", "warning"),
-    0x0100: ("initializing", "warning"),
-    0x0110: ("powering_up", "warning"),
-    0x0120: ("connecting_bus", "warning"),
-    0x0130: ("disconnecting_bus", "warning"),
-    0x0140: ("testing_bus", "warning"),
-    0x0200: ("low_bus_voltage", "warning"),
-    0x0300: ("standby", "warning"),
-    0x0310: ("waiting", "warning"),
-    0x0320: ("waiting_no_input", "warning"),
-    0x0330: ("waiting_heartbeat", "warning"),
-    0x0800: ("connecting_grid", "warning"),
-    0x0810: ("disconnecting_grid", "warning"),
-    0x0820: ("grid_connected", "normal"),
-    0x0830: ("islanded", "normal"),
-    0x1000: ("low_input", "warning"),
-    0x1010: ("testing_input", "warning"),
-    0x2000: ("running", "normal"),
-    0x2010: ("making_power", "normal"),
-    0x2020: ("limiting_power", "normal"),
-    0x3000: ("low_wind", "warning"),
-    0x3010: ("high_wind", "warning"),
-    0x3100: ("low_sun", "low_sun"),
-    0x6000: ("charging_battery", "normal"),
-    0x6010: ("regulating_battery", "normal"),
-    0x6020: ("charging_battery", "normal"),
-    0x6100: ("discharging_battery", "normal"),
-    0x6300: ("cell_imbalance", "warning"),
-    0x7000: ("error", "error"),
-    0x7010: ("input_over_voltage", "error"),
-    0x7020: ("output_over_voltage", "error"),
-    0x7030: ("input_over_current", "error"),
-    0x7040: ("output_over_current", "error"),
-    0x7100: ("over_temperature", "error"),
-    0x8000: ("offline", "error"),
-}
-
-PVRSS_SELF_TEST_RESULTS = {
-    0: "success",
-    1: "voc_low",
-    2: "none",
-    3: "vlow_high",
-    4: "count_mismatch",
-    5: "vlow_timeout",
-    6: "not_configured",
-    7: "count_out_of_range",
-    8: "vlow_low",
-}
-PVRSS_FAILURE_RESULTS = {1, 3, 4, 5, 7, 8}
-PV_ERROR_BITS = (
-    "hardware_arc_fault",
-    "reverse_current",
-    "input_over_current",
-    "input_over_voltage",
-    "ground_fault_test_failed",
-    "low_input_impedance",
-    "flash_crc_failed",
-    "eeprom_crc_failed",
-    "spt_crc_failed",
-    "over_temperature",
-    "dead_fet",
-    "hardware_version_mismatch",
-)
-
 SYSTEM_OPERATING_MODES = {
     0: (
         "SAFETY_SHUTDOWN",
@@ -227,16 +161,12 @@ SYSTEM_OPERATING_MODE_COMMANDS = {
 
 
 def decode_rebus_state(value: Any) -> dict[str, Any]:
+    """Raw-only compatibility helper; firmware interpretation needs definitions."""
     try:
         raw = int(value)
     except (TypeError, ValueError):
         raw = 0
-    code = raw & 0xFFF0
-    name, severity = REBUS_STATES.get(
-        code,
-        (f"unknown_0x{code:04x}", "error" if 0x7000 <= code <= 0x7FF0 else "warning"),
-    )
-    return {"status": name, "status_code": code, "status_code_hex": f"0x{code:04X}", "status_severity": severity}
+    return {"status": f"unknown_0x{raw:04x}", "status_code": raw, "status_code_hex": f"0x{raw:04X}", "status_severity": None}
 
 
 def decode_system_operating_mode(value: Any) -> dict[str, Any]:
@@ -311,11 +241,13 @@ class InstallerTelemetry:
         operating_mode_confirmation_interval: float = 5.0,
         operating_mode_confirmation_timeout: float = 30.0,
         sleeper: Callable[[float], None] = time.sleep,
+        definitions: Any = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.inventory = inventory
         self.ignored = {serial.upper() for serial in (ignored or [])}
         self.transport = transport
+        self.definitions = definitions if definitions is not None else RegisterDefinitions(transport)
         self.detail_interval = detail_interval
         self.detail_stale_after = detail_stale_after
         if (
@@ -1133,7 +1065,7 @@ class InstallerTelemetry:
         if common:
             state["firmware_version"] = common.get("Vr")
         if rebus:
-            state.update(decode_rebus_state(rebus.get("St")))
+            state.update(self._decode_status("REbus_status", "fixed", rebus.get("St")))
             state.update({
                 "rebus_power_w": _number(rebus, "P"),
                 "accumulated_energy_kwh": (_number(rebus, "E") / 1000) if _number(rebus, "E") is not None else None,
@@ -1144,9 +1076,8 @@ class InstallerTelemetry:
                 "rebus_bits": rebus.get("RB"),
             })
 
-    @staticmethod
     def _apply_pv_directory(
-        state: dict[str, Any], entry: dict[str, Any]
+        self, state: dict[str, Any], entry: dict[str, Any]
     ) -> bool:
         raw_status = entry.get("St")
         status_available = (
@@ -1156,7 +1087,7 @@ class InstallerTelemetry:
             and int(raw_status) == raw_status
         )
         if status_available:
-            state.update(decode_rebus_state(raw_status))
+            state.update(self._decode_status("REbus_dir", "repeating", raw_status))
         power = _number(entry, "P")
         if _valid_pv_power(power):
             state["rebus_power_w"] = power
@@ -1175,6 +1106,18 @@ class InstallerTelemetry:
         if "UpdtTm" in entry:
             state["directory_updated_at"] = entry["UpdtTm"]
         return status_available
+
+    def _decode_status(self, model, section, value):
+        decoded = self.definitions.decode(model, section, "St", value)
+        try:
+            raw = int(value)
+        except (TypeError, ValueError, OverflowError):
+            raw = None
+        return {
+            "status": decoded.get("state") if decoded and decoded["available"] else None,
+            "status_code": raw, "status_code_hex": f"0x{raw:04X}" if raw is not None else None,
+            "status_severity": "error" if decoded and decoded["errors"] else "warning" if decoded and decoded["warnings"] else "normal" if decoded and decoded["available"] and not decoded.get("unknown_code") and decoded.get("symbol") != "UNKNOWN" else None,
+        }
 
     def _pv_state(self, serial: str, now: float) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
         state = self._base_device(serial, "pv", now)
@@ -1212,8 +1155,6 @@ class InstallerTelemetry:
             )
         directory_health["core_state_available"] = directory_core_available
         pvrss = self._fresh_fixed(state, "pvrss_telemetry")
-        result = pvrss.get("SelfTestResults")
-        result_number = int(result) if isinstance(result, (int, float)) else None
         if pv:
             state.update({
                 "input_voltage_v": _number(pv, "Vin"),
@@ -1236,22 +1177,30 @@ class InstallerTelemetry:
         if pvrss:
             state.update({
                 "pvrss_status": pvrss.get("Status"),
-                "pvrss_self_test": PVRSS_SELF_TEST_RESULTS.get(result_number, result),
+                "pvrss_self_test": None,
                 "snaprs_installed": _number(pvrss, "InstalledCount"),
                 "snaprs_detected": _number(pvrss, "DetectedCount"),
                 "number_of_strings": _number(pvrss, "NumStrings"),
                 "telemetry_updated_at": pvrss.get("LastUpdatedUTCTimestamp"),
             })
-        state["error_names"] = [
-            name for bit, name in enumerate(PV_ERROR_BITS) if state["error_word"] & (1 << bit)
-        ]
-        fault_reasons = list(state["error_names"])
+        state["error_names"] = []
+        if self.definitions:
+            extra = ("REbus_dir", "repeating", directory_entry, directory_core_available) if directory_entry is not None else None
+            self.definitions.enrich(state, extra)
+            error_record = state["decoded_registers"].get("pvlink_status.fixed.ErrorWord")
+            state["error_names"] = error_record["errors"] if error_record and error_record["available"] else []
+            self_test = state["decoded_registers"].get("pvrss_telemetry.fixed.SelfTestResults")
+            if self_test and self_test["available"]:
+                state["pvrss_self_test"] = self_test["state"]
+            if state.get("status_severity") is None:
+                directory_core_available = False
+            state["core_state_available"] = directory_core_available or bool(state.get("status"))
+            directory_health["core_state_available"] = directory_core_available
+        fault_reasons = []
         if state.get("status_severity") == "error":
             fault_reasons.append(state["status"])
-        if result_number in PVRSS_FAILURE_RESULTS:
-            fault_reasons.append(f"pvrss_{state['pvrss_self_test']}")
-        if pvrss.get("LockoutError"):
-            fault_reasons.append("pvrss_lockout")
+        if self.definitions:
+            fault_reasons.extend(state["active_errors"])
         assessment_models = {"REbus_status", "pvlink_status", "pvrss_telemetry"}
         assessment_complete = all(
             state["endpoint_health"][model]["fresh"] for model in assessment_models
@@ -1261,12 +1210,18 @@ class InstallerTelemetry:
             for model in ("pvlink_status", "pvrss_telemetry")
         )
         core_fault_available = directory_core_available or assessment_complete
+        if self.definitions:
+            decoded = state["decoded_registers"]
+            detailed_fault_coverage = detailed_fault_coverage and all(
+                (record := decoded.get(key)) and record["available"] and not record["unknown_mask"] and not record.get("unknown_code")
+                for key in ("pvlink_status.fixed.ErrorWord", "pvrss_telemetry.fixed.Status", "pvrss_telemetry.fixed.SelfTestResults")
+            )
+            assessment_complete = assessment_complete and detailed_fault_coverage and state.get("status_severity") is not None
+            core_fault_available = directory_core_available or assessment_complete
         state["fault_reasons"] = sorted(set(fault_reasons))
         state["fault_assessment_complete"] = assessment_complete
         state["detailed_fault_coverage"] = detailed_fault_coverage
-        state["core_state_available"] = directory_core_available or bool(
-            state["endpoint_health"]["REbus_status"].get("fresh")
-        )
+        state["core_state_available"] = directory_core_available or (bool(state.get("status")) if self.definitions else bool(state["endpoint_health"]["REbus_status"].get("fresh")))
         state["fault"] = (
             True
             if state["fault_reasons"]
@@ -1324,6 +1279,8 @@ class InstallerTelemetry:
                     "minimum_cell_voltage_v": _number(battery, "CellVMin"),
                     "maximum_cell_voltage_v": _number(battery, "CellVMax"),
                 })
+        if self.definitions:
+            self.definitions.enrich(state)
         return state
 
     @staticmethod
@@ -1400,6 +1357,14 @@ class InstallerTelemetry:
             self._last_devices_success is not None
             and now - self._last_devices_success <= self.disconnect_after
         )
+        if self.definitions:
+            versions = {}
+            for (serial, model), payload in self._details.items():
+                if model == "common" and self._endpoint_health.get((serial, model), {}).get("last_success") is not None:
+                    version = _fixed(payload).get("Vr")
+                    if isinstance(version, str) and version:
+                        versions[serial] = version
+            self.definitions.note_versions(versions)
         pvs = {}
         power_issues: dict[str, list[tuple[str, Any]]] = {}
         for serial in self.inventory.serials:
@@ -1421,6 +1386,13 @@ class InstallerTelemetry:
                 continue
             battery = self._generic_state(serial, "battery", now)
             battery_modules[serial] = self._battery_module_group(battery)
+            if self.definitions:
+                all_decoded = battery.get("decoded_registers", {})
+                for index, module in battery_modules[serial]["modules"].items():
+                    raw_module = battery.get("raw_models", {}).get("lithium_ion_string", {}).get("repeating", {}).get(index, {})
+                    module["decoded_registers"] = self.definitions.module_registers("lithium_ion_string", index, raw_module, module["present"])
+                    module["serial"] = f"{serial}/module/{index}"
+                battery["decoded_registers"] = {key: value for key, value in all_decoded.items() if not key.startswith("lithium_ion_string.repeating.")}
             battery.get("raw_models", {}).pop("lithium_ion_string", None)
             battery.get("endpoint_health", {}).pop("lithium_ion_string", None)
             if not battery.get("raw_models"):
@@ -1473,6 +1445,8 @@ class InstallerTelemetry:
             "untracked_pv_link_count": len(untracked),
             "untracked_pv_links": untracked,
         }
+        if self.definitions:
+            system["register_definitions"] = self.definitions.health()
         if primary_power_valid:
             system["solar_power_w"] = sum(
                 self._last_devices[serial]["power"] for serial in visible_pv_serials

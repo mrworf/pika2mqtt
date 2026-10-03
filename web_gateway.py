@@ -91,10 +91,11 @@ class _GatewayServer(http.server.ThreadingHTTPServer):
 
 
 class InstallerWebGateway:
-    def __init__(self, config: WebGatewayConfig, transport, logger=None):
+    def __init__(self, config: WebGatewayConfig, transport, logger=None, definitions=None):
         self.config = config
         self.transport = transport
         self.logger = logger or logging.getLogger(__name__)
+        self.definitions = definitions
         self._server: Optional[_GatewayServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -173,6 +174,28 @@ class InstallerWebGateway:
                 parsed = urlsplit(self.path)
                 if parsed.scheme or parsed.netloc:
                     self._error(400, "Absolute request URLs are not accepted")
+                    return
+                if parsed.path in ("/diagnostics/registers", "/diagnostics/registers.md"):
+                    if method not in ("GET", "HEAD"):
+                        self._error(405, "Reference routes are read-only", extra_headers={"Allow": "GET, HEAD"})
+                        return
+                    markdown = parsed.path.endswith(".md")
+                    content = gateway.definitions.reference(html_format=not markdown) if gateway.definitions else None
+                    if content is None:
+                        self._error(503, "Register definitions not loaded")
+                        return
+                    body = content.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/markdown; charset=utf-8" if markdown else "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'")
+                    if markdown:
+                        self.send_header("Content-Disposition", 'attachment; filename="register_reference.md"')
+                    self.end_headers()
+                    if method != "HEAD":
+                        self.wfile.write(body)
                     return
                 if not gateway.transport.is_available():
                     self._error(503, "Installer tunnel is unavailable")

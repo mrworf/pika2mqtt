@@ -100,12 +100,25 @@ missing. Existing deployments need no configuration change; optionally set
 `DETAIL_REQUEST_TIMEOUT` if the 20-second default is unsuitable for a
 particularly slow appliance.
 
+Firmware register decoding is now loaded over SSH from the inverter at startup.
+Existing MQTT topics, control commands and entity identifiers remain intact, but
+Status text follows the firmware symbol names in lowercase. For example, older
+`input_over_voltage` states become `over_voltage_input`; `status_code` now preserves
+the complete code instead of masking its low four bits. Review automations that
+compare status strings or numeric codes. Status/fault interpretation is unavailable
+until definitions have loaded; measurements and control polling continue.
+
+New Last event and Active error count diagnostics are enabled automatically.
+Individual register flags are disabled by default. `/data` also stores the generated
+register reference and discovery manifest; keep this volume writable and persistent.
+
 - The SSH private key is now mandatory and should be mounted read-only.
 - `SSH_HOST_FINGERPRINT` is mandatory.
 - The Docker host must reach the inverter on TCP/22.
 - The container no longer connects to or maintains port 8000 on the inverter.
-- Mount a writable directory at `/data`; this stores only learned PV Link
-  identities. Keep it separate from the read-only SSH key mount.
+- Mount a writable directory at `/data`; this stores learned PV Link identities,
+  the register reference and discovery manifest. Keep it separate from the
+  read-only SSH key mount.
 - `-t` is no longer required when starting the container.
 - Published images now use `ghcr.io/mrworf/pika2mqtt`; replace the previous
   `mrworf/pika2mqtt` Docker Hub image name in Docker or Compose configurations.
@@ -296,6 +309,7 @@ file is preferred. The file takes precedence if both are set.
 | `DISCONNECT_AFTER` | `120` | Seconds before API/PV Link data is disconnected |
 | `PV_INVENTORY_FILE` | `/data/pv_inventory.json` | Versioned learned PV Link inventory |
 | `PV_INVENTORY_FREEZE` | `false` | Prevent newly observed PV Links from being learned |
+| `REGISTER_POLICY_FILE` | bundled `register_policy.json` | Optional complete symbol-based fault-classification policy override |
 | `HA_DISCOVERY_ENABLED` | `true` | Publish Home Assistant MQTT device discovery |
 | `HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant discovery prefix |
 | `OPERATING_MODE_CONTROL_ENABLED` | `false` | Allow approved operating-mode and PV Link enable controls through MQTT |
@@ -310,6 +324,98 @@ file is preferred. The file takes precedence if both are set.
 | `DEBUG` | empty | Set to `--debug` for verbose logs |
 
 The same behavior is available outside Docker through `pika2mqtt.py --help`.
+
+### Firmware register diagnostics and reference
+
+The container reads the installed SunSpec XML under
+`/opt/pika/sunspec-models/smdx/` through fingerprint-verified SSH. Numeric enum values
+and bit positions come from those files, including sparse bitfields. Definitions
+refresh after SSH reconnects and detected firmware changes; loading failures retry
+with backoff and jitter capped at 60 seconds without blocking telemetry polling.
+Temporary SSH failures retain validated definitions. A detected firmware change
+suspends interpretation until replacement definitions load. Conflicting definitions
+and ambiguous symbol positions remain unavailable rather than being guessed.
+
+Existing inverter, battery and PV Link devices gain these MQTT-discovered diagnostics:
+
+- **Last event**: the most recently reported event, with its raw code, symbol,
+  available description, supported states and definition checksum as attributes.
+  It is historical and does not contribute to active faults. Repeated occurrences
+  of the same event cannot be detected from this register alone.
+- **Active error count**: count of classified active error indicators, with the
+  names and coverage status as attributes. It becomes unavailable if required
+  assessment registers are missing, stale, ambiguous or contain unknown values.
+  Several indicators may describe the same underlying physical problem.
+- **Individual flags**: disabled-by-default diagnostic binary sensors for every
+  documented, non-reserved bit. Enable the desired entities on the device page to
+  use them in dashboards and automations. Error/warning flags use the problem
+  device class; ordinary flags retain their positive meaning, such as Heartbeat Good.
+- **Register definitions available**: a service diagnostic with source, checksum,
+  firmware versions and the latest load error as attributes.
+
+Status and self-test sensors include supported states and current interpretation as
+attributes. Extra enum sensors are disabled by default. Numeric raw-model diagnostics
+remain available. The `decoded_registers` object in each device state topic contains
+raw values, active symbols, descriptions, unknown-bit masks and interpretation
+availability. Stable flag identifiers use serial/model/register/bit position so
+firmware label changes do not replace entities. Temporary missing data does not
+remove entities; firmware definition changes reconcile obsolete generated components.
+
+PV Link Fault and Fault summary use corrected firmware error bits and PVRSS lockout
+interpretation. Core fault monitoring still works from a valid controller directory
+when detailed PV models fail. A normal core status does not prove that all detailed
+error registers have been checked: Detailed fault data unavailable and Active error
+count make that coverage distinction visible.
+
+The complete reference lives at **`/data/register_reference.md`** inside Docker. With
+`-v /your/path:/data`, read `/your/path/register_reference.md` on the Docker host.
+When `PV_INVENTORY_FILE` is customized, reference and manifest files live beside it.
+The file describes the last successfully loaded definitions; check its reported
+firmware and checksum when investigating an upgrade.
+
+With the optional web gateway enabled and its usual credentials configured, visit:
+
+- `http://<docker-host>:8000/diagnostics/registers` for an HTML reference.
+- `http://<docker-host>:8000/diagnostics/registers.md` to download the Markdown file.
+
+These routes require the same authentication as the installer gateway and are always
+read-only, even with `WEB_WRITE_ENABLED=true`. They use local reference data and work
+through a temporary tunnel outage. Before definitions load, or during firmware
+replacement, they return HTTP 503. Web access remains disabled unless `WEB_ENABLED=true`
+and the gateway port is published.
+
+The reference lists every supported enum state/flag, numeric value or bit position,
+firmware description and application-policy classification. Many firmware entries
+provide only a symbol name; those are explicitly marked **No description provided by
+firmware**. Policy classification is separate from the firmware's documentation.
+The [Generac PWRcell inverter installation and owner's manual](https://www.generac.com/globalassets/residential/dealers--installers/generac-installer-programs/solar--battery-installer-support/a0001424068-rev-j-1o-pwrcell-inverter-install-and-owners-manual.pdf)
+provides operating and troubleshooting context but does not define every internal
+register. Consult the reference from your own firmware for the available values.
+The firmware bundle can include models for hardware you do not have. Home Assistant
+entities are generated only for models and records collected for your devices.
+
+For an automation, enable the relevant binary sensor, select it using Home Assistant's
+entity picker, and trigger on `off` → `on` for an error (or `on` → `off` for a positive
+health flag). Use `for:` to require a sustained condition, and handle `unavailable`
+separately. An unavailable reading is not a cleared fault. Check supported states
+before comparing an enum sensor's state in a template.
+
+Severity comes from the bundled [register_policy.json](register_policy.json), not
+hard-coded firmware numbers. To customize it, copy the entire file, mount the copy
+read-only, set `REGISTER_POLICY_FILE` to its container path, and restart the container.
+The CLI equivalent is `--register-policy-file`. All six version-1 fields are required:
+`version`, `error_registers`, `bitfields`, `assessment_registers`, `errors`, and `warnings`.
+The policy uses model/register names and firmware symbols. `bitfields` resolves the
+documented directory `Rb` field whose XML type is integer despite bit-position
+symbols. `assessment_registers` defines the coverage needed for each device kind's
+error count. Invalid policies fail startup with an explanatory log.
+
+Container logs record definition loads/checksums and initial decoded observations.
+Subsequent state/event/flag changes are INFO; classified errors, warnings and unknown
+indicators are WARNING; error clearance is INFO. Unchanged observations are suppressed.
+After stale data, a recovered observation is logged without claiming when a transition
+happened. Event log timestamps are observation times, not inverter event timestamps.
+Set `DEBUG=--debug` to include decoded register details and repeated loader diagnostics.
 Passwords intentionally have no web-gateway command-line option so they do not
 appear in process arguments.
 

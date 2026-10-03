@@ -165,6 +165,8 @@ class SshTunnelSupervisor:
         self._transport_failures = 0
         self._retry_attempt = 0
         self._runtime_directory: Optional[tempfile.TemporaryDirectory] = None
+        self._known_hosts: Optional[str] = None
+        self.connection_generation = 0
 
     @property
     def base_url(self) -> str:
@@ -187,6 +189,27 @@ class SshTunnelSupervisor:
 
     def wait_fatal(self, timeout: Optional[float] = None) -> bool:
         return self._fatal.wait(timeout)
+
+    def read_definition_archive(self) -> bytes:
+        """Read installed XML with the same verified host identity as the tunnel."""
+        if not self.is_available() or not self._known_hosts:
+            raise OSError("SSH tunnel is unavailable")
+        command = [
+            "ssh", "-F", "/dev/null", "-i", self.config.private_key,
+            "-p", str(self.config.ssh_port), "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={self._known_hosts}",
+            "-o", f"ConnectTimeout={self.config.connect_timeout}",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+            f"root@{self.config.hostname}",
+            "tar -c -C /opt/pika/sunspec-models smdx",
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=30, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise OSError("SSH definition read timed out") from error
+        if result.returncode:
+            raise OSError(result.stderr.decode(errors="replace").strip() or "SSH definition read failed")
+        return result.stdout
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -311,6 +334,8 @@ class SshTunnelSupervisor:
 
                 connected_at = time.monotonic()
                 self._recycle.clear()
+                self._known_hosts = known_hosts
+                self.connection_generation += 1
                 self._available.set()
                 self._set_state("connected")
                 downtime = connected_at - outage_started

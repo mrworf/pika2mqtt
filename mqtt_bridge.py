@@ -6,7 +6,9 @@ import json
 import logging
 import re
 import threading
+from pathlib import Path
 from typing import Any
+from register_definitions import atomic_write
 
 from telemetry import SYSTEM_OPERATING_MODE_COMMANDS
 
@@ -29,6 +31,7 @@ class MqttBridge:
         discovery_enabled: bool = True,
         discovery_prefix: str = "homeassistant",
         operating_mode_control_enabled: bool = False,
+        diagnostic_manifest_file: str | None = None,
     ):
         self.client = client
         self.base_topic = base_topic.strip("/")
@@ -45,6 +48,18 @@ class MqttBridge:
         self._root_serial: str | None = None
         self._discovery_payloads: dict[str, str] = {}
         self._known_battery_modules: dict[str, set[int]] = {}
+        self._manifest_file = diagnostic_manifest_file
+        self._diagnostic_manifest = {}
+        if diagnostic_manifest_file:
+            try:
+                manifest = json.loads(Path(diagnostic_manifest_file).read_text())
+                if not isinstance(manifest, dict) or any(not isinstance(key, str) or not isinstance(values, dict) or not isinstance(values.get("components"), dict) or not isinstance(values.get("checksum"), str) for key, values in manifest.items()):
+                    raise ValueError("invalid manifest")
+                self._diagnostic_manifest = manifest
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError) as error:
+                LOG.warning("Cannot load register discovery manifest: %s", error)
         self.client.will_set(
             self._topic("availability/service"),
             "disconnected",
@@ -289,6 +304,29 @@ class MqttBridge:
                     self._topic(f"availability/model/{device['serial']}/{model}"),
                     "available" if health.get("fresh") else "unavailable",
                 )
+        diagnostic_devices = list(devices)
+        for group in snapshot.get("battery_modules", {}).values():
+            diagnostic_devices.extend(group.get("modules", {}).values())
+        health = snapshot["system"].get("register_definitions", {})
+        self._publish(self._topic("availability/definitions"), "available" if health.get("available") else "unavailable")
+        observed_register_topics = set()
+        for device in diagnostic_devices:
+            if not device or "serial" not in device:
+                continue
+            serial = device["serial"]
+            for key, register in device.get("decoded_registers", {}).items():
+                topic = self._topic(f"availability/register/{serial}/{stable_id(key)}")
+                observed_register_topics.add(topic)
+                self._publish(topic, "available" if register["available"] else "unavailable")
+            topic = self._topic(f"availability/register/{serial}/errors")
+            observed_register_topics.add(topic)
+            self._publish(topic, "available" if device.get("active_error_count") is not None else "unavailable")
+        for manifest in self._diagnostic_manifest.values():
+            for component in manifest["components"].values():
+                for entry in component.get("availability", []):
+                    topic = entry["topic"]
+                    if topic.startswith(self._topic("availability/register/")) and topic not in observed_register_topics:
+                        self._publish(topic, "unavailable")
 
     def _availability(self, include_inverter=True, pv_serial: str | None = None):
         topics = [self._topic("availability/service")]
@@ -395,10 +433,75 @@ class MqttBridge:
 
     def _publish_config(self, object_id: str, config: dict[str, Any], force: bool):
         topic = f"{self.discovery_prefix}/device/{object_id}/config"
+        health = (self._latest or {}).get("system", {}).get("register_definitions", {})
+        valid = bool(health.get("available"))
+        checksum = health.get("checksum") or ""
+        previous = self._diagnostic_manifest.get(topic, {"components": {}, "checksum": ""})
+        old_components = previous["components"]
+        if not valid or previous["checksum"] == checksum:
+            # Missing observations do not imply a register was removed from firmware.
+            config = {**config, "components": {**old_components, **config["components"]}}
         payload = self._json(config)
         if force or self._discovery_payloads.get(topic) != payload:
-            self._publish(topic, payload)
+            generated = {key: value for key, value in config["components"].items() if key.startswith("decoded_")}
+            # Only validated definitions justify deleting firmware-generated entities.
+            if valid:
+                removed = set(old_components) - set(generated)
+                if removed:
+                    removal = {**config, "components": {**config["components"], **{key: {} for key in removed}}}
+                    if getattr(self._publish(topic, self._json(removal)), "rc", 0):
+                        return
+            if getattr(self._publish(topic, payload), "rc", 0):
+                return
             self._discovery_payloads[topic] = payload
+            manifest = {"checksum": checksum, "components": generated}
+            if valid and previous != manifest:
+                self._diagnostic_manifest[topic] = manifest
+                if self._manifest_file:
+                    try:
+                        atomic_write(self._manifest_file, self._json(self._diagnostic_manifest))
+                    except OSError as error:
+                        LOG.warning("Cannot persist register discovery manifest: %s", error)
+
+    def _diagnostic_components(self, root, topic, state, availability):
+        components = {}
+        if not state or "decoded_registers" not in state:
+            return components
+        serial = state["serial"]
+        for key, register in state["decoded_registers"].items():
+            register_availability = availability + [{"topic": self._topic(f"availability/register/{serial}/{stable_id(key)}"), "payload_available": "available", "payload_not_available": "unavailable"}]
+            access = "value_json.decoded_registers[" + json.dumps(key) + "]"
+            attributes = {"json_attributes_topic": topic, "json_attributes_template": "{{ {'raw': " + access + ".raw, 'symbol': " + access + ".symbol, 'active_symbols': " + access + ".active_symbols, 'description': " + access + ".description, 'unknown_mask': " + access + ".unknown_mask, 'definition_checksum': " + access + ".checksum, 'supported_states': " + access + ".supported_states} | tojson }}"}
+            if register["kind"].startswith("enum"):
+                component_key = "decoded_" + stable_id(key)
+                name = "Last event" if register["register"] == "Ev" and register["model"] == "REbus_status" else f"{register['model']} {register['label']}"
+                components[component_key] = self._component("sensor", f"{root}_{component_key}", name, topic, "{{ " + access + ".state }}", register_availability, entity_category="diagnostic", enabled_by_default=(name == "Last event"), **attributes)
+            else:
+                for bit, metadata in register["flags"].items():
+                    component_key = "decoded_" + stable_id(key) + f"_bit_{bit}"
+                    name = f"{register['model']} {register['register']} {metadata['label']}"
+                    flag_attributes = {**attributes, "json_attributes_template": "{{ {'raw': " + access + ".raw, 'symbol': " + json.dumps(metadata["symbol"]) + ", 'description': " + json.dumps(metadata["description"]) + ", 'policy_classification': " + json.dumps(metadata["severity"]) + ", 'definition_checksum': " + access + ".checksum} | tojson }}"}
+                    components[component_key] = self._component("binary_sensor", f"{root}_{component_key}", name, topic, "{{ 'ON' if " + json.dumps(metadata["symbol"]) + " in " + access + ".active_symbols else 'OFF' }}", register_availability, payload_on="ON", payload_off="OFF", device_class="problem" if metadata["severity"] in ("warning", "error") else None, entity_category="diagnostic", enabled_by_default=False, **flag_attributes)
+        if "active_error_count" in state:
+            key = "decoded_active_error_count"
+            components[key] = self._sensor(root, "active_error_count", "Active error count", topic, object_key=key,
+                availability=availability + [{"topic": self._topic(f"availability/register/{serial}/errors"), "payload_available": "available", "payload_not_available": "unavailable"}],
+                entity_category="diagnostic", json_attributes_topic=topic,
+                json_attributes_template="{{ {'active_errors': value_json.active_errors, 'coverage_complete': value_json.error_coverage_complete} | tojson }}")
+        return components
+
+    def _status_attributes(self, components, topic, state):
+        if not state or "decoded_registers" not in state:
+            return
+        registers = state["decoded_registers"]
+        status_key = "REbus_dir.repeating.St" if "REbus_dir.repeating.St" in registers else "REbus_status.fixed.St"
+        for component_key, key in (("inverter_status", status_key), ("status", status_key), ("status_code", status_key), ("pvrss_self_test", "pvrss_telemetry.fixed.SelfTestResults")):
+            component = components.get(component_key)
+            if component is None:
+                continue
+            component["availability"] = component["availability"] + [{"topic": self._topic(f"availability/register/{state['serial']}/{stable_id(key)}"), "payload_available": "available", "payload_not_available": "unavailable"}]
+            access = "value_json.decoded_registers[" + json.dumps(key) + "]"
+            component.update(json_attributes_topic=topic, json_attributes_template="{{ {'raw': " + access + ".raw, 'symbol': " + access + ".symbol, 'description': " + access + ".description, 'supported_states': " + access + ".supported_states} | tojson }}")
 
     def _publish_discovery(self, snapshot: dict[str, Any], force: bool) -> None:
         inverter = snapshot.get("inverter")
@@ -465,6 +568,10 @@ class MqttBridge:
                 inverter_serial,
             )
         )
+        components.update(self._diagnostic_components(root, inverter_topic, inverter, parent_availability))
+        self._status_attributes(components, inverter_topic, inverter)
+        if "register_definitions" in snapshot["system"]:
+            components["decoded_definitions_available"] = self._component("binary_sensor", f"{root}_decoded_definitions_available", "Register definitions available", system_topic, "{{ 'ON' if value_json.register_definitions.available else 'OFF' }}", service_availability, payload_on="ON", payload_off="OFF", entity_category="diagnostic", json_attributes_topic=system_topic, json_attributes_template="{{ value_json.register_definitions | tojson }}")
         self._publish_config(
             root,
             self._config(self._device(root, "Generac PWRcell", "PWRcell inverter"), components),
@@ -525,6 +632,8 @@ class MqttBridge:
         components.update(
             self._raw_components(child, topic, battery, availability, serial)
         )
+        components.update(self._diagnostic_components(child, topic, battery, availability))
+        self._status_attributes(components, topic, battery)
         self._publish_config(child, self._config(self._device(child, "PWRcell battery", "PWRcell battery", root), components), force)
 
     def _publish_battery_module_discovery(
@@ -590,6 +699,8 @@ class MqttBridge:
             )
             for key, name, device_class, unit in diagnostics
         })
+        module = (self._latest or {}).get("battery_modules", {}).get(serial, {}).get("modules", {}).get(str(index))
+        components.update(self._diagnostic_components(child, topic, module, availability))
         self._publish_config(
             child,
             self._config(
@@ -688,6 +799,8 @@ class MqttBridge:
         components.update(
             self._raw_components(child, topic, pv, measurement_availability, serial)
         )
+        components.update(self._diagnostic_components(child, topic, pv, measurement_availability))
+        self._status_attributes(components, topic, pv)
         self._publish_config(child, self._config(self._device(child, f"PV Link {serial}", "PV Link", root), components), force)
 
     def _raw_components(self, root, topic, state, availability, serial=None):

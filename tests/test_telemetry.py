@@ -5,6 +5,7 @@ import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+from register_definitions import RegisterDefinitions
 
 import requests
 
@@ -107,6 +108,10 @@ class TelemetryTests(unittest.TestCase):
             return Response(value)
 
         inventory = PvInventory(str(Path(directory, "inventory.json")), clock=lambda: now)
+        if "definitions" not in kwargs:
+            definitions = RegisterDefinitions(None, data_directory=directory)
+            definitions.install({"registers.xml": Path("tests/fixtures/registers.xml").read_bytes()})
+            kwargs["definitions"] = definitions
         return InstallerTelemetry(
             "http://installer",
             inventory,
@@ -154,7 +159,7 @@ class TelemetryTests(unittest.TestCase):
             modules = snapshot["battery_modules"]["000100080001"]["modules"]
             self.assertEqual(len(modules), 6)
             self.assertEqual(
-                modules["1"],
+                {key: value for key, value in modules["1"].items() if key not in ("serial", "decoded_registers")},
                 {
                     "index": 1,
                     "present": True,
@@ -197,7 +202,8 @@ class TelemetryTests(unittest.TestCase):
 
             self.assertTrue(group["endpoint_health"]["fresh"])
             self.assertEqual(set(group["modules"]), {"1", "2", "3"})
-            self.assertEqual(group["modules"]["2"], {"index": 2, "present": False})
+            self.assertFalse(group["modules"]["2"]["present"])
+            self.assertTrue(all(not record["available"] for record in group["modules"]["2"]["decoded_registers"].values()))
 
     def test_battery_module_inventory_ignores_invalid_and_oversized_indices(self):
         payload = {
@@ -1366,10 +1372,10 @@ class TelemetryTests(unittest.TestCase):
             self.assertFalse(snapshot["pv_links"]["000100030001"]["connected"])
 
     def test_fault_and_unknown_status_are_separate_from_connectivity(self):
-        self.assertEqual(decode_rebus_state(0x201F)["status"], "making_power")
+        self.assertEqual(decode_rebus_state(0x201F)["status_code"], 0x201F)
         decoded = decode_rebus_state(0x4555)
-        self.assertEqual(decoded["status"], "unknown_0x4550")
-        self.assertEqual(decoded["status_severity"], "warning")
+        self.assertEqual(decoded["status"], "unknown_0x4555")
+        self.assertIsNone(decoded["status_severity"])
 
         with tempfile.TemporaryDirectory() as directory:
             routes = {"/devices": self.fixture("devices.json")}
