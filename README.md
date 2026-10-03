@@ -1,173 +1,82 @@
-# Pika to MQTT
+# Pika to MQTT for Home Assistant
 
 [![CI](https://github.com/mrworf/pika2mqtt/actions/workflows/docker-image.yml/badge.svg?branch=master)](https://github.com/mrworf/pika2mqtt/actions/workflows/docker-image.yml)
 [![Container image](https://img.shields.io/badge/GHCR-pika2mqtt-2ea44f?logo=github)](https://github.com/mrworf/pika2mqtt/pkgs/container/pika2mqtt)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-Pika to MQTT reads a Pika Energy/Generac PWRcell inverter's local installer API
-and publishes its power data to MQTT. Everything stays on the local network; no
-Generac cloud service is involved.
+Bring your Pika Energy / Generac PWRcell solar system into Home Assistant over
+local MQTT. Monitor solar production, grid flow, batteries and individual PV Links;
+optionally change operating mode and enable or disable PV Links from dashboards
+and automations. No Generac cloud service is involved.
 
-Generac only permits the installer site to be reached from localhost or its
-provisioning network. Pika to MQTT therefore opens a resilient SSH tunnel to the
-inverter's localhost port 80. It does not install a proxy, alter the inverter's
-firewall, or persist anything on the inverter beyond the authorized root SSH
-key described in [the installer guide](extras/INSTALLER.md).
+pika2mqtt runs in Docker and creates devices through Home Assistant's
+[MQTT integration](https://www.home-assistant.io/integrations/mqtt).
+No custom Home Assistant integration or HACS installation is required. Monitoring
+is enabled by default; write controls and web access are opt-in.
 
-## Docker quick start
+## What you get
 
-The SSH private key is required. Keep it outside the repository, set its mode to
-`0600`, and mount it read-only. Create a separate directory for the learned PV
-Link inventory:
+| Device or feature | Available by default | Optional capabilities |
+| --- | --- | --- |
+| PWRcell inverter / system | Solar and inverter power, grid import/export power and energy, operating mode, string counts and aggregate communication/fault alerts | Operating-mode selector; additional firmware diagnostics |
+| Each battery | State of charge, state of health, charging/discharging power, capacity and REbus status/measurements | Raw model and firmware flag diagnostics |
+| Each battery module | State of charge and state of health | Cell count and minimum/maximum/average cell voltage and temperature diagnostics |
+| Each learned PV Link | Power, status, enabled state, communication lost, fault summary, REbus measurements and supported SnapRS/PVRSS measurements | Enable/disable switch and detailed diagnostic flags |
+| Firmware diagnostics | Last event, Active error count and definition-loading health | Individual register flags and extra enum/raw sensors, disabled by default |
+| Installer website | Disabled | Authenticated local installer access and HTML/Markdown register reference |
+
+Values depend on what your firmware and hardware expose. An unsupported or stale
+measurement becomes unavailable; its absence does not mean the device has failed.
+A battery module contains multiple physical cells: the installer API exposes
+module SoC/SoH, not SoC/SoH for each physical cell.
+
+The container maintains a resilient SSH tunnel to the inverter's local installer
+server. It reconnects automatically after network outages and inverter reboots,
+with activity visible in Docker logs. It does not install a proxy or change the
+inverter firewall.
+
+## Before you start
+
+You need:
+
+- An inverter prepared for root SSH access and its matching private key. Follow
+  the [inverter preparation guide](extras/INSTALLER.md) first if this is not already
+  configured. This is an unsupported integration and preparation requires modifying
+  the inverter's storage; the guide covers backups and the persistent key.
+- The inverter's address and independently verified ED25519 SSH host fingerprint.
+- A Docker host that can reach the inverter on TCP/22 and your MQTT broker.
+- A working MQTT broker, its address and any required credentials. Home Assistant
+  must connect to the same broker with MQTT discovery enabled.
+- A writable, persistent directory for inventory, register reference and discovery
+  metadata, separate from the read-only SSH key.
+
+If you use Home Assistant's Mosquitto broker app, see its
+[setup and user instructions](https://github.com/home-assistant/addons/blob/master/mosquitto/DOCS.md).
+An external broker also works. Use an address reachable from this container:
+a Home Assistant internal app hostname may not resolve on a separate Docker host.
+
+## First-time setup
+
+### 1. Prepare the key and fingerprint
+
+Keep the private key outside the repository and protect its permissions. Replace
+the example paths and inverter address with your own:
 
 ```sh
 chmod 600 /secure/path/pika-rsa
 mkdir -p /secure/path/pika2mqtt-data
 
-docker run -d \
-  --name pika2mqtt \
-  --restart unless-stopped \
-  -e HOSTNAME=192.168.1.42 \
-  -e MQTT=mqtt.local \
-  -e BASETOPIC=house/energy \
-  -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
-  -v /secure/path/pika-rsa:/key/id_rsa:ro \
-  -v /secure/path/pika2mqtt-data:/data \
-  ghcr.io/mrworf/pika2mqtt:latest
-```
-
-Obtain the inverter's ED25519 host-key fingerprint from a trusted LAN before
-starting the container:
-
-```sh
 ssh-keyscan -t ed25519 192.168.1.42 2>/dev/null \
   | ssh-keygen -lf - -E sha256
 ```
 
-Confirm the fingerprint through a trusted connection or console. The container
-will refuse a different host identity rather than disabling SSH verification.
+Independently confirm the complete `SHA256:...` fingerprint through a trusted
+connection or console. The container refuses a different host identity.
 
-MQTT authentication remains optional:
+### 2. Start the container with Docker Compose
 
-```sh
--e MQTT_USER=pika2mqtt -e MQTT_PASSWORD='mqtt-password'
-```
-
-Follow tunnel state and reconnect attempts through normal container logs:
-
-```sh
-docker logs -f pika2mqtt
-```
-
-The supervisor detects SSH exits and unusable tunnels, uses SSH keepalives,
-retries with jittered exponential backoff capped at 60 seconds, and resumes
-polling automatically after an inverter reboot or network outage.
-
-The CI workflow tests every branch and pull request. Successful pushes to
-`master` publish `linux/amd64` and `linux/arm64` images to GitHub Container
-Registry as `latest`, `master`, and an immutable `sha-<commit>` tag. A tag such
-as `v1.2.3` publishes the corresponding container tag as well.
-
-## Migrating an existing Docker installation
-
-This release is not a drop-in replacement for either the older port-8000 proxy
-image or the previous MQTT publisher. Home Assistant discovery is now enabled
-by default and replaces the legacy per-value topic tree with retained JSON
-state. Existing dashboards and automations that directly reference topics such
-as `<base>/solar_total/output`, `<base>/battery_<serial>/charge`, or
-`<base>/connected/state` must be moved to the discovered entities or the new
-topics documented below. The old topics stop updating immediately after the
-upgrade. In particular, battery percentage is now a real percentage rather
-than a value multiplied by ten, and the incorrect interval `*_kwh` topics have
-been removed.
-
-The `HOSTNAME`, `MQTT`, `MQTT_USER`, `MQTT_PASSWORD`, `BASETOPIC`, `IGNORE`,
-and `/key/id_rsa` interfaces remain available. Transport and persistent-state
-requirements are:
-
-If an existing deployment already sets `OPERATING_MODE_CONTROL_ENABLED=true`,
-upgrading also exposes an `Enabled Control` switch for every PV Link. Review
-MQTT ACLs and Home Assistant user permissions before upgrading, or set the flag
-to `false` until PV Link control is desired. The read-only Enabled entity and
-all existing state topics remain compatible.
-
-This release also changes PV Link availability semantics. Core status and
-fault monitoring now use the controller directory and remain available when
-firmware rejects optional per-PV model reads. The existing Fault and Status
-entity identifiers are unchanged. A new disabled-by-default `Detailed fault
-data unavailable` diagnostic reports when PVLink/PVRSS-specific coverage is
-missing. Existing deployments need no configuration change; optionally set
-`DETAIL_REQUEST_TIMEOUT` if the 20-second default is unsuitable for a
-particularly slow appliance.
-
-Firmware register decoding is now loaded over SSH from the inverter at startup.
-Existing MQTT topics, control commands and entity identifiers remain intact, but
-Status text follows the firmware symbol names in lowercase. For example, older
-`input_over_voltage` states become `over_voltage_input`; `status_code` now preserves
-the complete code instead of masking its low four bits. Review automations that
-compare status strings or numeric codes. Status/fault interpretation is unavailable
-until definitions have loaded; measurements and control polling continue.
-
-New Last event and Active error count diagnostics are enabled automatically.
-Individual register flags are disabled by default. `/data` also stores the generated
-register reference and discovery manifest; keep this volume writable and persistent.
-
-- The SSH private key is now mandatory and should be mounted read-only.
-- `SSH_HOST_FINGERPRINT` is mandatory.
-- The Docker host must reach the inverter on TCP/22.
-- The container no longer connects to or maintains port 8000 on the inverter.
-- Mount a writable directory at `/data`; this stores learned PV Link identities,
-  the register reference and discovery manifest. Keep it separate from the
-  read-only SSH key mount.
-- `-t` is no longer required when starting the container.
-- Published images now use `ghcr.io/mrworf/pika2mqtt`; replace the previous
-  `mrworf/pika2mqtt` Docker Hub image name in Docker or Compose configurations.
-
-Before updating, retain the old container or its Compose configuration so it
-can be restored. Stop the old container before starting the new version; an old
-instance left running may continue reinstalling the obsolete Pi-side proxy.
-Compose users should also give the currently running image an immutable local
-rollback tag before pulling `latest`:
-
-```sh
-docker image tag "$(docker inspect --format '{{.Image}}' pika2mqtt)" \
-  pika2mqtt:pre-ssh-tunnel
-```
-
-Obtain and independently verify the fingerprint as shown above, make sure the
-existing private key has mode `0600`, and then migrate using the appropriate
-deployment style.
-
-### Existing `docker run` deployment
-
-Pull the new image, preserve the stopped old container for rollback, and create
-the replacement with the additional fingerprint setting:
-
-```sh
-docker pull ghcr.io/mrworf/pika2mqtt:latest
-docker stop pika2mqtt
-docker rename pika2mqtt pika2mqtt-pre-ssh-tunnel
-
-docker run -d \
-  --name pika2mqtt \
-  --restart unless-stopped \
-  -e HOSTNAME=192.168.1.42 \
-  -e MQTT=mqtt.local \
-  -e BASETOPIC=house/energy \
-  -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
-  -v /secure/path/pika-rsa:/key/id_rsa:ro \
-  -v /secure/path/pika2mqtt-data:/data \
-  ghcr.io/mrworf/pika2mqtt:latest
-```
-
-Carry over any existing MQTT credentials, `IGNORE`, `DEBUG`, custom `IDRSA`, or
-other settings from the old container. Do not copy the example addresses or
-credentials literally.
-
-### Existing Docker Compose deployment
-
-Update the service to include the fingerprint and a read-only key mount. A
-minimal complete service is:
+Save this as `compose.yaml`, replacing addresses, paths, fingerprint and MQTT
+credentials. If your broker permits anonymous access, omit both credential fields.
 
 ```yaml
 services:
@@ -176,118 +85,210 @@ services:
     container_name: pika2mqtt
     restart: unless-stopped
     environment:
-      HOSTNAME: 192.168.1.42
-      MQTT: mqtt.local
-      BASETOPIC: house/energy
+      HOSTNAME: "192.168.1.42"
+      MQTT: "mqtt.local"
+      MQTT_PORT: "1883"
+      MQTT_USER: "pika2mqtt"
+      MQTT_PASSWORD: "replace-with-your-mqtt-password"
+      BASETOPIC: "house/energy"
       SSH_HOST_FINGERPRINT: "SHA256:replace-with-your-fingerprint"
     volumes:
       - /secure/path/pika-rsa:/key/id_rsa:ro
       - /secure/path/pika2mqtt-data:/data
 ```
 
-Keep any existing MQTT credentials and other optional environment values, then
-recreate the service:
-
 ```sh
-docker compose pull pika2mqtt
-docker compose up -d --force-recreate pika2mqtt
+docker compose up -d
+docker compose logs -f pika2mqtt
 ```
 
-### Verify and roll back
+No container ports need to be published for MQTT telemetry or Home Assistant
+controls. The default primary polling interval is 15 seconds. To request five-second
+primary polling, add `REFRESH: "5"` under `environment`; detailed models retain their
+separate polling interval.
 
-Follow startup and recovery state in the container logs:
+<details>
+<summary>Alternative: docker run</summary>
 
-```sh
-docker logs -f pika2mqtt
-```
-
-A successful migration logs `Connecting SSH tunnel`, followed by
-`SSH tunnel established`, `MQTT broker connected`, and `Starting the telemetry
-monitor`. Confirm that Home Assistant creates the PWRcell device and its PV Link
-children. Fingerprint mismatches and corrupt inventory files are fatal;
-network, SSH, MQTT, and inverter reboot failures remain logged and recover with
-bounded backoff.
-
-Initially leave `PV_INVENTORY_FREEZE=false`. After all expected PV Links have
-appeared in Home Assistant and the inventory log (six on the system used during
-development), restart with `PV_INVENTORY_FREEZE=true`. Learning is additive and
-has no built-in limit, so future arrays with a different number of strings work
-without code changes. With learning frozen, a new unrecognized string is
-reported in the system state but is not added as a monitored child.
-
-To intentionally relearn the array, stop the container, delete only the file
-configured by `PV_INVENTORY_FILE`, start with learning unfrozen, verify the
-expected strings, then freeze again. Never delete, move, or change permissions
-on `/key/id_rsa` as part of this process.
-
-No inverter cleanup is required. The old proxy process and firewall rule are
-ignored by the new container and normally disappear on an inverter reboot. A
-stale proxy file is harmless. Keep the authorized root key because the SSH
-tunnel requires it.
-
-If another tool or bookmark previously used `http://<inverter>:8000`, that
-endpoint is no longer maintained. Enable the web gateway described below,
-publish its port explicitly, and use `http://<docker-host>:8000` instead. The
-gateway requires Basic Auth and remains read-only unless
-`WEB_WRITE_ENABLED=true` is set.
-
-To roll back a `docker run` deployment, stop and remove only the replacement,
-restore the preserved container name, and restart it:
+Use the same prepared key, data directory and verified fingerprint:
 
 ```sh
-docker stop pika2mqtt
-docker rm pika2mqtt
-docker rename pika2mqtt-pre-ssh-tunnel pika2mqtt
-docker start pika2mqtt
-```
-
-For Compose, restore the saved Compose file, set the service image to
-`pika2mqtt:pre-ssh-tunnel`, and recreate the service. Rollback does not require
-changing the inverter or removing its authorized key.
-
-## Optional installer website
-
-The web gateway is disabled by default. To expose authenticated, read-only
-access on the Docker host's port 8000, create a password secret and explicitly
-publish the port:
-
-```sh
-printf '%s\n' 'choose-a-strong-password' >/secure/path/pika-web-password
-chmod 600 /secure/path/pika-web-password
-
 docker run -d \
   --name pika2mqtt \
   --restart unless-stopped \
   -e HOSTNAME=192.168.1.42 \
   -e MQTT=mqtt.local \
+  -e MQTT_USER=pika2mqtt \
+  -e MQTT_PASSWORD='replace-with-your-mqtt-password' \
   -e BASETOPIC=house/energy \
   -e SSH_HOST_FINGERPRINT='SHA256:replace-with-your-fingerprint' \
-  -e WEB_ENABLED=true \
-  -e WEB_USERNAME=operator \
-  -e WEB_PASSWORD_FILE=/run/secrets/pika-web-password \
   -v /secure/path/pika-rsa:/key/id_rsa:ro \
   -v /secure/path/pika2mqtt-data:/data \
-  -v /secure/path/pika-web-password:/run/secrets/pika-web-password:ro \
-  -p 8000:8000 \
   ghcr.io/mrworf/pika2mqtt:latest
+
+docker logs -f pika2mqtt
 ```
 
-Open `http://<docker-host>:8000/` and enter the configured Basic Auth
-credentials. Read-only mode permits GET, HEAD, and OPTIONS, which is sufficient
-to load the installer interface and inspect values. Other methods return 405.
+Continue with the same verification steps below.
 
-To allow installer POST and other write methods, add:
+</details>
 
-```sh
--e WEB_WRITE_ENABLED=true
+Images are published for `linux/amd64` and `linux/arm64`. Use `latest` for the
+current build from `master`, or an immutable `sha-<commit>` tag to pin a deployment.
+Version tags, when published, are also available.
+
+### 3. Verify Home Assistant discovery
+
+Make sure Home Assistant's MQTT integration is configured for the same broker.
+Discovery is enabled by default in pika2mqtt with the `homeassistant` prefix.
+
+Look for `SSH tunnel established`, `MQTT broker connected`,
+`Starting the telemetry monitor` and `Loaded firmware register definitions` in
+the logs. These messages may appear in a different order. Definition loading and
+device measurements can take longer than the first primary poll.
+
+In Home Assistant, open **Settings → Devices & services → MQTT** and inspect its
+devices. Expect a PWRcell system/inverter, your batteries and their reported modules,
+and one device per learned PV Link. Confirm that solar power, battery percentages
+and operating mode match your system. Detailed entities appear as their data arrives.
+
+Initially leave `PV_INVENTORY_FREEZE=false`. Confirm every expected PV Link is
+discovered and its serial matches your array; check the `Learned PV Link` log messages.
+Then optionally add `PV_INVENTORY_FREEZE: "true"` and recreate the container with
+`docker compose up -d`. Frozen inventory keeps known strings monitored and reports
+new, unrecognized strings without silently adding them. There is no fixed string
+count; use the number installed in your system.
+
+## Using the integration in Home Assistant
+
+### Dashboards and the Energy dashboard
+
+Use the discovered solar, grid, battery and per-string power sensors in dashboard
+cards. Power is in watts, energy in kWh, and battery percentages are already
+percentages—no scaling templates are needed.
+
+Positive grid power means export; positive battery power means discharge.
+Separate nonnegative grid import/export and battery charging/discharging power
+sensors make dashboards easier to read.
+
+For the Energy dashboard, use **Grid imported energy** and **Grid exported energy**,
+which come from native inverter counters when available. Solar power is an
+instantaneous measurement; the integration does not supply a dedicated solar-yield
+energy counter. To derive solar energy, follow Home Assistant's
+[energy guidance](https://www.home-assistant.io/docs/energy/) for integrating power
+over time. Such energy is an estimate and depends on valid samples.
+
+Do not use **Inverter accumulated energy** as solar production: inverter energy
+can include other sources. Battery/module SoC and SoH are health and charge
+measurements, not energy-throughput counters.
+
+### Monitor each PV Link
+
+Each string has separate signals with different meanings:
+
+- **Enabled**: whether the PV Link is enabled.
+- **Communication lost**: whether the string stopped communicating; a disabled
+  string can still communicate normally.
+- **Fault / Fault summary**: observed current fault state and its interpretation.
+- **Detailed fault data unavailable**: optional diagnostic indicating reduced
+  coverage when detailed models cannot be read.
+
+Use Home Assistant's entity picker to create an alert for an individual string or
+the system's **String disconnected** and **String fault** aggregate sensors.
+For problem sensors, `on` indicates a problem. Consider a sustained-state duration
+to avoid transient alerts, and handle `unavailable` separately.
+
+Communication loss is declared after 120 seconds by default. Detailed values have
+a two-minute freshness window; only affected entities become unavailable after
+their source ages out. A normal core Fault reading does not prove every detailed
+register was checked—use the coverage diagnostics when investigating.
+
+PV production values below 0 W or above 5,000 W per string are rejected. The
+affected power entity becomes unavailable, and aggregate solar power is withheld
+if a primary string sample is invalid. Values are not clamped to a plausible number.
+
+### Optional operating-mode and PV Link controls
+
+Add this under your Compose service's `environment`, then recreate the container:
+
+```yaml
+OPERATING_MODE_CONTROL_ENABLED: "true"
 ```
 
-Write mode can change safety- and operation-relevant inverter configuration.
-Enable it only when needed. Basic Auth does not encrypt traffic, so publish this
-port only on a trusted LAN or place a TLS reverse proxy in front of it.
+This single flag enables both:
 
-`WEB_PASSWORD` may be used instead of `WEB_PASSWORD_FILE`, but a mounted secret
-file is preferred. The file takes precedence if both are set.
+- A **System Operating Mode Control** selector with **Grid Tie**, **Self Supply**,
+  **Clean Backup** and **Priority Backup**.
+- An **Enabled Control** switch for each PV Link.
+
+The read-only operating-mode and Enabled entities remain available. Other modes
+can be read but are not offered as commands. Controls work in dashboards and
+Home Assistant automations using the discovered selector and switches.
+
+Commands are confirmed against inverter/controller readback before the new state
+is published. A failed or unconfirmed command is logged and its write is not retried.
+After enabling controls, manually verify one intended change when operationally
+safe and restore your preferred state; check the inverter/installer interface and
+container logs. Validate PV Links individually.
+
+Use broker ACLs so only intended users can publish commands. The MQTT control flag
+is independent of `WEB_ENABLED` and `WEB_WRITE_ENABLED`; no web gateway is required.
+See the [control protocol and validation details](docs/TECHNICAL.md#optional-operating-mode-and-pv-link-control).
+
+### Firmware events, flags and register reference
+
+**Last event** reports the most recently observed device event, not an active fault
+or a complete event history. **Active error count** includes classified current
+indicators; it is unavailable when the required assessment is incomplete.
+Several indicators can describe one physical problem.
+
+Open a device's entity list to enable the diagnostic flags you want to monitor or
+use in automations. Status/enum attributes list supported states; register attributes
+include raw values, symbols and available descriptions. Definitions are loaded from
+your inverter's firmware, so supported flags can differ between systems.
+
+The generated reference lists states, flags, numeric values, firmware descriptions
+and application fault classifications:
+
+- **File:** `/data/register_reference.md` inside the container, or
+  `/secure/path/pika2mqtt-data/register_reference.md` with the example mount.
+- **HTML:** `http://<docker-host>:8000/diagnostics/registers`.
+- **Markdown download:** `http://<docker-host>:8000/diagnostics/registers.md`.
+
+Web routes require the optional gateway and its authentication. Many firmware
+symbols have no description; the reference explicitly says so. See the
+[technical guide](docs/TECHNICAL.md#firmware-register-diagnostics-and-reference)
+for policy overrides, unknown values and definition-loading behavior.
+
+## Optional installer website
+
+To add authenticated installer access and the register-reference pages to your
+Compose service, configure:
+
+```yaml
+environment:
+  WEB_ENABLED: "true"
+  WEB_USERNAME: "operator"
+  WEB_PASSWORD_FILE: "/run/secrets/pika-web-password"
+volumes:
+  - /secure/path/pika-web-password:/run/secrets/pika-web-password:ro
+ports:
+  - "8000:8000"
+```
+
+Merge these entries into the existing service; retain its MQTT settings, key and
+data mounts. Create the password file with your chosen password and restrict its
+permissions to `0600`, then recreate the container.
+
+Open `http://<docker-host>:8000/` and authenticate. The gateway is read-only by
+default; some installer actions need POST and therefore do not work in that mode.
+Set `WEB_WRITE_ENABLED: "true"` only if you intend to allow installer configuration
+changes. The reference routes always remain read-only.
+
+Basic Auth does not encrypt traffic: expose the gateway on a trusted LAN or put
+a TLS reverse proxy in front of it. `WEB_PASSWORD` is an alternative to the password
+file; the file takes precedence. Web passwords have no CLI option, avoiding exposure
+in process arguments.
 
 ## Configuration
 
@@ -325,321 +326,36 @@ file is preferred. The file takes precedence if both are set.
 
 The same behavior is available outside Docker through `pika2mqtt.py --help`.
 
-### Firmware register diagnostics and reference
-
-The container reads the installed SunSpec XML under
-`/opt/pika/sunspec-models/smdx/` through fingerprint-verified SSH. Numeric enum values
-and bit positions come from those files, including sparse bitfields. Definitions
-refresh after SSH reconnects and detected firmware changes; loading failures retry
-with backoff and jitter capped at 60 seconds without blocking telemetry polling.
-Temporary SSH failures retain validated definitions. A detected firmware change
-suspends interpretation until replacement definitions load. Conflicting definitions
-and ambiguous symbol positions remain unavailable rather than being guessed.
-
-Existing inverter, battery and PV Link devices gain these MQTT-discovered diagnostics:
-
-- **Last event**: the most recently reported event, with its raw code, symbol,
-  available description, supported states and definition checksum as attributes.
-  It is historical and does not contribute to active faults. Repeated occurrences
-  of the same event cannot be detected from this register alone.
-- **Active error count**: count of classified active error indicators, with the
-  names and coverage status as attributes. It becomes unavailable if required
-  assessment registers are missing, stale, ambiguous or contain unknown values.
-  Several indicators may describe the same underlying physical problem.
-- **Individual flags**: disabled-by-default diagnostic binary sensors for every
-  documented, non-reserved bit. Enable the desired entities on the device page to
-  use them in dashboards and automations. Error/warning flags use the problem
-  device class; ordinary flags retain their positive meaning, such as Heartbeat Good.
-- **Register definitions available**: a service diagnostic with source, checksum,
-  firmware versions and the latest load error as attributes.
-
-Status and self-test sensors include supported states and current interpretation as
-attributes. Extra enum sensors are disabled by default. Numeric raw-model diagnostics
-remain available. The `decoded_registers` object in each device state topic contains
-raw values, active symbols, descriptions, unknown-bit masks and interpretation
-availability. Stable flag identifiers use serial/model/register/bit position so
-firmware label changes do not replace entities. Temporary missing data does not
-remove entities; firmware definition changes reconcile obsolete generated components.
-
-PV Link Fault and Fault summary use corrected firmware error bits and PVRSS lockout
-interpretation. Core fault monitoring still works from a valid controller directory
-when detailed PV models fail. A normal core status does not prove that all detailed
-error registers have been checked: Detailed fault data unavailable and Active error
-count make that coverage distinction visible.
-
-The complete reference lives at **`/data/register_reference.md`** inside Docker. With
-`-v /your/path:/data`, read `/your/path/register_reference.md` on the Docker host.
-When `PV_INVENTORY_FILE` is customized, reference and manifest files live beside it.
-The file describes the last successfully loaded definitions; check its reported
-firmware and checksum when investigating an upgrade.
-
-With the optional web gateway enabled and its usual credentials configured, visit:
-
-- `http://<docker-host>:8000/diagnostics/registers` for an HTML reference.
-- `http://<docker-host>:8000/diagnostics/registers.md` to download the Markdown file.
-
-These routes require the same authentication as the installer gateway and are always
-read-only, even with `WEB_WRITE_ENABLED=true`. They use local reference data and work
-through a temporary tunnel outage. Before definitions load, or during firmware
-replacement, they return HTTP 503. Web access remains disabled unless `WEB_ENABLED=true`
-and the gateway port is published.
-
-The reference lists every supported enum state/flag, numeric value or bit position,
-firmware description and application-policy classification. Many firmware entries
-provide only a symbol name; those are explicitly marked **No description provided by
-firmware**. Policy classification is separate from the firmware's documentation.
-The [Generac PWRcell inverter installation and owner's manual](https://www.generac.com/globalassets/residential/dealers--installers/generac-installer-programs/solar--battery-installer-support/a0001424068-rev-j-1o-pwrcell-inverter-install-and-owners-manual.pdf)
-provides operating and troubleshooting context but does not define every internal
-register. Consult the reference from your own firmware for the available values.
-The firmware bundle can include models for hardware you do not have. Home Assistant
-entities are generated only for models and records collected for your devices.
-
-For an automation, enable the relevant binary sensor, select it using Home Assistant's
-entity picker, and trigger on `off` → `on` for an error (or `on` → `off` for a positive
-health flag). Use `for:` to require a sustained condition, and handle `unavailable`
-separately. An unavailable reading is not a cleared fault. Check supported states
-before comparing an enum sensor's state in a template.
-
-Severity comes from the bundled [register_policy.json](register_policy.json), not
-hard-coded firmware numbers. To customize it, copy the entire file, mount the copy
-read-only, set `REGISTER_POLICY_FILE` to its container path, and restart the container.
-The CLI equivalent is `--register-policy-file`. All six version-1 fields are required:
-`version`, `error_registers`, `bitfields`, `assessment_registers`, `errors`, and `warnings`.
-The policy uses model/register names and firmware symbols. `bitfields` resolves the
-documented directory `Rb` field whose XML type is integer despite bit-position
-symbols. `assessment_registers` defines the coverage needed for each device kind's
-error count. Invalid policies fail startup with an explanatory log.
-
-Container logs record definition loads/checksums and initial decoded observations.
-Subsequent state/event/flag changes are INFO; classified errors, warnings and unknown
-indicators are WARNING; error clearance is INFO. Unchanged observations are suppressed.
-After stale data, a recovered observation is logged without claiming when a transition
-happened. Event log timestamps are observation times, not inverter event timestamps.
-Set `DEBUG=--debug` to include decoded register details and repeated loader diagnostics.
-Passwords intentionally have no web-gateway command-line option so they do not
-appear in process arguments.
-
-## MQTT and Home Assistant
-
-All state, availability, and discovery messages use QoS 1 and retained
-payloads. The broker last will and graceful shutdown payload are both
-`disconnected`; a successful MQTT session publishes `connected`. The publisher
-automatically reconnects with bounded backoff and republishes state and
-discovery after reconnect or a `homeassistant/status` birth message.
-
-State is normalized JSON under:
-
-```text
-house/energy/state/system
-house/energy/state/inverter
-house/energy/state/grid
-house/energy/state/battery/000100080701
-house/energy/state/battery/000100080701/module/1
-house/energy/state/pv/00010003119C
-```
-
-When control is explicitly enabled, commands use:
-
-```text
-house/energy/command/system_operating_mode
-house/energy/command/pv/00010003119C/enabled
-```
-
-Availability uses:
-
-```text
-house/energy/availability/service
-house/energy/availability/inverter
-house/energy/availability/pv/00010003119C
-house/energy/availability/pv/00010003119C/enabled
-house/energy/availability/control/pv/00010003119C
-house/energy/availability/battery/000100080701/modules
-house/energy/availability/battery/000100080701/module/1
-house/energy/availability/power/solar
-house/energy/availability/power/pv/00010003119C
-```
-
-Power-specific availability uses `available` and `unavailable`. It lets Home
-Assistant suppress only a bad power measurement without treating the inverter
-or PV Link as disconnected.
-
-Home Assistant discovery creates one PWRcell inverter/system device, a battery
-child, a child for each battery module, and one child per learned PV Link.
-Principal power, battery, energy, status, connectivity, SnapRS, and PVRSS
-measurements are exposed directly. The
-inverter includes an enabled `System Operating Mode` sensor decoded from
-`SysMd` (for example, `Clean Backup`), while its stable enum key, numeric code,
-and model description remain available in the inverter JSON.
-Every scalar supplied by the detailed installer models is also available as a
-disabled-by-default diagnostic entity.
-
-Battery module data comes from the inverter's `lithium_ion_string_module`
-model. Each module child exposes state of charge and state of health by
-default. Its physical cell count and minimum, maximum, and average cell voltage
-and temperature are available as disabled-by-default diagnostics. A module is
-a replaceable PWRcell battery module containing multiple physical cells; the
-installer API does not expose SoC or SoH for each physical cell.
-
-The existing aggregate PWRcell battery device and state topic are unchanged.
-Module measurements use separate state and availability topics. If the model
-is stale, all known module children become unavailable and stale measurements
-are not republished. If the model reports an expected module number without a
-corresponding record, that child remains visible but unavailable, making a
-missing module distinguishable from a module that was never discovered.
-
-### Optional operating mode and PV Link control
-
-All write controls are disabled by default. To add a separate Home Assistant
-`System Operating Mode Control` selector and an `Enabled Control` switch to
-each PV Link, set:
-
-```yaml
-environment:
-  OPERATING_MODE_CONTROL_ENABLED: "true"
-```
-
-The selector permits only `Grid Tie`, `Self Supply`, `Clean Backup`, and
-`Priority Backup`. Safety Shutdown, Remote Arbitrage, and Sell remain readable
-but cannot be commanded through pika2mqtt. The existing read-only System
-Operating Mode sensor remains available for dashboards and automations.
-
-Each PV Link switch sends an exact, non-retained `ON` or `OFF` command. The
-existing read-only `Enabled` binary sensor is unchanged. It prefers the
-controller's fresh device-directory state and falls back to `pvlink_status`
-when the directory is unavailable; the control switch itself becomes
-unavailable unless the service, inverter, PV Link, and authoritative directory
-mapping are all available.
-
-pika2mqtt does not assume that a PV Link's Modbus ID is its writable directory
-block. Before every command it reads `/device/1/model/REbus_dir/devices` and
-requires one exact match using the current Modbus unit ID plus the manufacturer,
-device type, and device ID encoded in the 12-hex RCP serial. An already-matching
-state is a write-free no-op. Otherwise pika2mqtt sends one form POST to that
-same repeating-block route using the verified one-based `<block>_Ena` field
-with value `1` or `0`. It does not retry the write.
-
-After a write, the directory is read immediately and every five seconds for up
-to 30 seconds. The identity is re-resolved each time, and the new state is
-published only after the same mapping reports the requested value. Missing,
-stale, malformed, changed, or ambiguous mappings are rejected and logged;
-failure preserves the last confirmed state.
-
-Home Assistant sends a non-retained command and pika2mqtt rejects any retained
-command received on the topic. The displayed selection is not changed
-optimistically. pika2mqtt sends one `0_SysMd` fixed-block form POST to the
-writable system controller model at `/device/1/model/REbus_dir`; it never
-writes the read-only `inverter_status` model. It reads the controller and
-inverter status immediately, then every five seconds for up to 30 seconds, and
-publishes the new state only after both independently report the requested
-mode. Failed or unconfirmed commands are logged and the write is not retried.
-
-Older images either sent the request to read-only `inverter_status` or omitted
-the installer API's required `0_` fixed-block field prefix. A selection could
-therefore appear successful briefly or be silently ignored. Do not use
-operating-mode automation with an affected image; pull and recreate the
-container with the corrected image first.
-
-Anyone who can publish to a command topic can change system behavior. Use MQTT
-broker ACLs so only the intended Home Assistant account can publish to
-`house/energy/command/system_operating_mode` and
-`house/energy/command/pv/+/enabled`; other consumers should receive read-only
-access.
-
-Actual mode or PV Link changes are intentionally not exercised against a live
-inverter by the automated tests. After enabling the feature, the system owner
-should manually verify operating-mode control as follows:
-
-1. Record the current mode and watch `docker logs -f pika2mqtt`.
-2. Select one of the four approved modes in Home Assistant.
-3. Confirm the log reports the command as confirmed and both the selector and
-   read-only sensor show the chosen mode.
-4. Confirm the installer interface and inverter display agree, then observe the
-   selection for at least ten minutes and several telemetry refreshes.
-5. Restore the preferred operating mode if the test used a temporary setting.
-
-Do this only when changing the inverter mode is operationally safe. The MQTT
-control flag is independent of `WEB_WRITE_ENABLED`; the installer web gateway
-does not need to be exposed or write-enabled.
-
-Verify each PV Link switch separately during safe daylight and load conditions:
-watch the container log, toggle only the intended string, confirm both the
-installer interface and the read-only Enabled entity agree, then restore the
-desired state before proceeding to another string. Do not send commands to all
-strings at once during initial validation.
-
-Power uses watts, battery charge uses percent, and energy uses kWh. Positive
-grid power means export and positive battery power means discharge; separate
-nonnegative import/export and charge/discharge sensors are also provided. Grid
-import/export energy comes from the inverter's native `REbus_exp` `Whin` and
-`Whx` counters. Other device energy counters are labeled accumulated energy
-rather than being misrepresented as solar production.
-
-PV Link production is accepted only when it is a finite value from 0 W through
-5000 W inclusive. Negative values, higher spikes, non-finite values, and missing
-samples are omitted rather than clamped or cached. The affected string power
-sensor becomes unavailable while its other telemetry remains usable. If any
-visible string has an invalid primary sample, aggregate solar power is also
-omitted and unavailable instead of reporting a partial total. The container
-logs one warning when a string enters an invalid-data episode and an
-informational message when valid power resumes.
-
-Each PV Link has independent communication, enabled, and fault signals.
-Communication is based on `/devices` presence and `lastheard`; the
-`Communication lost` entity changes only after 120 seconds by default. A PV
-Link that is disabled but still responding therefore shows Enabled Off and
-Communication lost OK. A detailed model returning HTTP 400/500 does not by
-itself disconnect a string.
-
-Detailed model values have a two-minute freshness window. A brief endpoint
-failure continues to use the last confirmed value, but after that window only
-the affected model-backed entities become unavailable. `/devices` power,
-last-heard age, and communication monitoring remain usable. Cached raw model
-payloads remain in MQTT JSON for diagnosis with `endpoint_health` freshness and
-age, request duration, failure classification, consecutive-failure, and retry
-metadata, but stale data is not used for normalized values or fault decisions.
-The controller directory supplies each PV Link's core REbus status, voltage,
-current, temperature, enabled state, and safe power fields. Core Fault remains
-available from that source when optional PV models fail. Fresh optional models
-add PV Link error bits, PVRSS lockout, and failed PVRSS self-tests; the
-disabled-by-default `Detailed fault data unavailable` diagnostic identifies
-reduced coverage. The system device provides separate aggregate “any string
-disconnected” and “any string faulted” binary sensors for alerting.
-
-The collector follows the endpoint contract used by the installer UI:
-`/devices`; controller `REbus_dir/devices`; inverter `common`, `REbus_status`,
-`inverter_status`, `REbus_exp`, and `inverter`; battery `common`, `REbus_status`,
-and `battery`; and PV Link `common`, `REbus_status`, `pvlink_status`, and
-`pvrss_telemetry`. Detailed model
-requests run serially in a separate worker with a persistent HTTP session and
-a configurable 20-second timeout, so a slow or hung model cannot delay
-`/devices` polling. The fast controller directory is prioritized when several
-routes are due. Requests are spaced rather than sent as one synchronized
-burst. Detailed model errors are classified and retried with staggered
-per-route exponential backoff using a 15-minute base at the maximum cadence.
-The installer does not provide `Retry-After`; directory `UpdtTm` values are
-sample timestamps, not requested polling delays. Identical persistent failures
-warn once until the error changes or the endpoint recovers.
-HTTP 500 responses and read timeouts from an individual model affect only that
-endpoint; they do not recycle a healthy SSH tunnel. Primary `/devices`
-connection failures remain authoritative for tunnel-health recovery.
-
-Set `HA_DISCOVERY_ENABLED=false` to consume the JSON topics without Home
-Assistant discovery, for example through Telegraf or InfluxDB.
-
 ## Troubleshooting
 
-- `SSH host-key mismatch`: stop and verify whether the inverter host key
-  legitimately changed after service or firmware replacement. Update the
-  configured fingerprint only after independent verification.
-- `SSH tunnel connection failed`: confirm port 22 reachability, the root public
-  key installation, private-key permissions, and the configured address.
-- Repeated reconnect logs: the delay will increase to at most 60 seconds; the
-  container should remain running and recover automatically.
-- Web gateway returns 503: the SSH tunnel is currently disconnected.
-- Web gateway returns 502: the tunnel exists but the installer server did not
-  complete that request.
-- Web gateway returns 405: write methods are disabled; enable
-  `WEB_WRITE_ENABLED` only if the operation is intended.
+| Symptom | Check |
+| --- | --- |
+| No Home Assistant devices | Same broker on both sides, valid MQTT credentials, Home Assistant MQTT discovery enabled, matching discovery prefix, broker ACLs and container logs |
+| Mode selector or PV Link switches missing | Set `OPERATING_MODE_CONTROL_ENABLED=true` and recreate the container; the read-only sensors alone do not enable controls |
+| An entity is disabled | Enable it from the device's entity list; extra diagnostics are disabled by default |
+| Entities show unavailable | Inspect communication and model freshness separately; allow definitions to load, and check Detailed fault data unavailable and logs |
+| Unknown status or flag | Compare its raw value and firmware reference; undocumented values are preserved rather than guessed |
+| Command fails or mode does not change | Check confirmation errors in logs and verify manually in the installer interface; do not repeatedly issue writes |
+| `SSH host-key mismatch` | Independently verify the inverter's current host key before updating the configured fingerprint |
+| `SSH tunnel connection failed` | Check TCP/22 reachability, inverter address, authorized public key and private-key permissions |
+| Repeated reconnects | Recovery backoff grows to at most 60 seconds; leave the container running and investigate network/inverter availability |
+| Web returns 503 | Installer requests need an available tunnel; reference routes need loaded definitions |
+| Web returns 502 | The installer server did not complete the forwarded request |
+| Web returns 405 | Installer write methods are disabled, or a write was attempted on a read-only reference route |
 
-The historical port-8000 Python proxy and firewall workaround are no longer
-used or supported.
+Follow activity with `docker compose logs -f pika2mqtt` or `docker logs -f pika2mqtt`.
+Set `DEBUG=--debug` for detailed diagnostics. Retained state is accompanied by
+availability: an unavailable reading should not be treated as a cleared fault.
+
+## Upgrades and advanced use
+
+- [Migration and rollback guide](docs/MIGRATION.md) — older Docker images, topic
+  changes, status-string compatibility and historical control fixes.
+- [Technical reference](docs/TECHNICAL.md) — MQTT topics, control confirmation,
+  firmware definitions, fault policy and polling/retry behavior.
+- [Inverter preparation](extras/INSTALLER.md) — install the persistent root public key.
+- [Container images](https://github.com/mrworf/pika2mqtt/pkgs/container/pika2mqtt)
+  and [CI builds](https://github.com/mrworf/pika2mqtt/actions/workflows/docker-image.yml).
+
+The normalized JSON MQTT topics can also be used without Home Assistant. Set
+`HA_DISCOVERY_ENABLED=false` for another consumer, such as Telegraf or InfluxDB.
