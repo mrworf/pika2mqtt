@@ -489,18 +489,22 @@ class MqttBridge:
         # Retain tombstones in the final message too: HA may be offline during
         # the intermediate cleanup publication. Persist their identities across
         # restarts/firmware changes, independently of firmware pruning.
-        config = {**config, "components": {**config["components"], **{key: {} for key in legacy_keys}}}
+        config = {**config, "components": {
+            **config["components"],
+            **{key: {"platform": "binary_sensor"} for key in legacy_keys},
+        }}
         payload = self._json(config)
         if force or self._discovery_payloads.get(topic) != payload:
-            generated = {key: value for key, value in config["components"].items() if key.startswith("decoded_") and value}
+            generated = {key: value for key, value in config["components"].items()
+                         if key.startswith("decoded_") and key not in legacy_keys}
             removed_booleans = self._removed_boolean_components.setdefault(topic, set())
             legacy = legacy_keys - removed_booleans
             if legacy:
                 # Distinct replacement keys make cleanup safe on every restart.
-                # Omitted components are retained by HA; only {} removes them.
+                # HA requires the original platform even for removal entries.
                 cleanup = {**config, "components": {
                     **{key: value for key, value in config["components"].items() if not key.endswith("_truth")},
-                    **{key: {} for key in legacy},
+                    **{key: {"platform": "binary_sensor"} for key in legacy},
                 }}
                 if getattr(self._publish(topic, self._json(cleanup)), "rc", 0):
                     return
@@ -509,7 +513,10 @@ class MqttBridge:
             if valid:
                 removed = set(old_components) - set(generated)
                 if removed:
-                    removal = {**config, "components": {**config["components"], **{key: {} for key in removed}}}
+                    removal = {**config, "components": {
+                        **config["components"],
+                        **{key: {"platform": old_components[key]["platform"]} for key in removed},
+                    }}
                     if getattr(self._publish(topic, self._json(removal)), "rc", 0):
                         return
             if getattr(self._publish(topic, payload), "rc", 0):

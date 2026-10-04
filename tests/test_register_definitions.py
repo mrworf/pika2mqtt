@@ -275,7 +275,7 @@ class DiagnosticMqttTests(unittest.TestCase):
         bridge.publish_snapshot(data)
         bridge.on_connect(client, None, None, 0)
         config = json.loads([p[1] for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")][-1])
-        flags = [c for key, c in config["components"].items() if "_bit_" in key and c]
+        flags = [c for key, c in config["components"].items() if "_bit_" in key and "unique_id" in c]
         self.assertTrue(flags)
         for flag in flags:
             template = Environment(undefined=StrictUndefined).from_string(flag["value_template"])
@@ -312,13 +312,14 @@ class DiagnosticMqttTests(unittest.TestCase):
             bridge.publish_snapshot(data)
             bridge.on_connect(client, None, None, 0)
             configs = [json.loads(p[1]) for p in client.published if p[0] == topic]
-            self.assertEqual(configs[0]["components"]["decoded_pvlink_status_fixed_errorword_bit_1"], {})
+            self.assertEqual(configs[0]["components"]["decoded_pvlink_status_fixed_errorword_bit_1"], {"platform": "binary_sensor"})
             final = configs[-1]["components"]
             self.assertIn("decoded_pvlink_status_fixed_errorword_bit_1_truth", final)
-            self.assertEqual(final["decoded_pvlink_status_fixed_errorword_bit_1"], {})
+            self.assertEqual(final["decoded_pvlink_status_fixed_errorword_bit_1"], {"platform": "binary_sensor"})
             cached = json.loads(Path(manifest).read_text())[topic]
             self.assertEqual(cached["checksum"], legacy[topic]["checksum"])
             self.assertFalse(any(c["platform"] == "binary_sensor" for c in cached["components"].values()))
+            self.assertTrue(all("unique_id" in c for c in cached["components"].values()))
             for p in client.published:
                 if p[0].startswith("energy/availability/register/"):
                     self.assertEqual(p[1], "unavailable")
@@ -329,7 +330,7 @@ class DiagnosticMqttTests(unittest.TestCase):
             bridge.on_connect(client, None, None, 0)
             for p in client.published:
                 if p[0] == topic:
-                    self.assertFalse(any(k.endswith("_truth") and not c for k, c in json.loads(p[1])["components"].items()))
+                    self.assertFalse(any(k.endswith("_truth") and len(c) == 1 for k, c in json.loads(p[1])["components"].items()))
 
     def test_manifest_removes_obsolete_components_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -346,16 +347,16 @@ class DiagnosticMqttTests(unittest.TestCase):
             client.published.clear()
             bridge.publish_snapshot(data)
             configs = [json.loads(p[1]) for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")]
-            self.assertTrue(any(c["components"].get("decoded_rebus_status_fixed_rb_bit_0_truth") == {} for c in configs))
+            self.assertTrue(any(c["components"].get("decoded_rebus_status_fixed_rb_bit_0_truth") == {"platform": "sensor"} for c in configs))
             self.assertNotIn("decoded_rebus_status_fixed_rb_bit_0_truth", configs[-1]["components"])
-            self.assertEqual(configs[-1]["components"]["decoded_rebus_status_fixed_rb_bit_0"], {})
+            self.assertEqual(configs[-1]["components"]["decoded_rebus_status_fixed_rb_bit_0"], {"platform": "binary_sensor"})
             # Offline HA sees only retained discovery; cleanup must survive a
             # restart after firmware stopped exposing the historical bit.
             bridge = MqttBridge(client, "energy", "inv", diagnostic_manifest_file=manifest)
             bridge.publish_snapshot(data)
             bridge.on_connect(client, None, None, 0)
             final = json.loads([p[1] for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")][-1])
-            self.assertEqual(final["components"]["decoded_rebus_status_fixed_rb_bit_0"], {})
+            self.assertEqual(final["components"]["decoded_rebus_status_fixed_rb_bit_0"], {"platform": "binary_sensor"})
 
     def test_unavailable_definitions_do_not_prune_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

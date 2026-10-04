@@ -9,6 +9,15 @@ from jinja2 import Environment, StrictUndefined
 from mqtt_bridge import MqttBridge
 
 
+def validate_discovery_components(config):
+    """Enforce HA's device-component platform/removal contract, not its full schema."""
+    for key, component in config["components"].items():
+        if component.get("platform") not in ("sensor", "binary_sensor", "switch", "select"):
+            raise ValueError(f"Missing or unsupported discovery platform: {key}")
+        if len(component) > 1 and "unique_id" not in component:
+            raise ValueError(f"Missing discovery unique_id: {key}")
+
+
 class PublishResult:
     def __init__(self, rc=0):
         self.rc = rc
@@ -31,6 +40,8 @@ class FakeClient:
         self.reconnect_delay = kwargs
 
     def publish(self, topic, payload, **kwargs):
+        if "/device/" in topic and topic.endswith("/config") and payload:
+            validate_discovery_components(json.loads(payload))
         result = PublishResult()
         self.published.append((topic, payload, kwargs, result))
         return result
@@ -92,6 +103,13 @@ class MqttBridgeTests(unittest.TestCase):
         return {topic: json.loads(payload) for topic, payload, _, _ in self.client.published
                 if topic.startswith("homeassistant/device/")}
 
+    def test_device_discovery_accepts_typed_removals_and_rejects_empty_components(self):
+        for platform in ("binary_sensor", "sensor"):
+            validate_discovery_components({"components": {"old": {"platform": platform}}})
+        for component in ({}, {"unique_id": "old"}, {"platform": "sensor", "name": "Invalid"}):
+            with self.subTest(component=component), self.assertRaises(ValueError):
+                validate_discovery_components({"components": {"old": component}})
+
     def test_truth_states_polarity_and_missing_values(self):
         data = snapshot()
         data["system"]["register_definitions"] = {"available": True}
@@ -135,12 +153,12 @@ class MqttBridgeTests(unittest.TestCase):
         self.connect()
         topic = "homeassistant/device/pika2mqtt_pv_00010003119c/config"
         configs = [json.loads(p) for t, p, _, _ in self.client.published if t == topic]
-        self.assertEqual(configs[0]["components"]["disconnected"], {})
+        self.assertEqual(configs[0]["components"]["disconnected"], {"platform": "binary_sensor"})
         self.assertNotIn("disconnected_truth", configs[0]["components"])
         self.assertIn("power", configs[0]["components"])
         final = configs[-1]
         for name in ("disconnected", "fault", "enabled", "detailed_fault_data_unavailable"):
-            self.assertEqual(final["components"][name], {})
+            self.assertEqual(final["components"][name], {"platform": "binary_sensor"})
             self.assertIn(name + "_truth", final["components"])
         self.bridge.republish(force_discovery=True)
         self.bridge = MqttBridge(self.client, "house/energy", "inverter.local")
@@ -149,8 +167,8 @@ class MqttBridgeTests(unittest.TestCase):
         for t, payload, _, _ in self.client.published:
             if t.startswith("homeassistant/device/"):
                 components = json.loads(payload)["components"]
-                self.assertFalse(any(c.get("platform") == "binary_sensor" for c in components.values()))
-                self.assertFalse(any(k.endswith("_truth") and not c for k, c in components.items()))
+                self.assertFalse(any(c.get("platform") == "binary_sensor" and len(c) > 1 for c in components.values()))
+                self.assertFalse(any(k.endswith("_truth") and len(c) == 1 for k, c in components.items()))
 
     def test_failed_truth_cleanup_is_retried_before_replacements(self):
         config = self.bridge._config({}, {"flag": self.bridge._binary("root", "flag", "Flag", "state", availability=[])})

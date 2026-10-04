@@ -62,6 +62,10 @@ After updating:
 1. Wait for MQTT discovery and definitions to load. Legacy binary discovery is
    removed automatically; persisted firmware flags are also migrated if definition
    loading is temporarily unavailable.
+   If you installed the initial True/False image but still see OK/Problem, pull
+   the corrected image and recreate the container. Its discovery removal entries
+   now include the required platform; it republishes corrected discovery on startup.
+   No manual MQTT cleanup is needed for this correction.
 2. Replace old binary-sensor references in dashboards, automations, scripts, and
    helpers with the newly discovered sensors. Re-enable optional diagnostic flags
    and reapply any custom names/settings to their new entities as needed.

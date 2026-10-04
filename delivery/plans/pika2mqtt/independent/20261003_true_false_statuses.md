@@ -19,6 +19,8 @@ automation migration guidance.
 
 1. [Truth sensors and migration](20261003_true_false_statuses_slice_01.md): the complete
    discovery/availability behavior, tests, and documentation in one coherent commit.
+2. [Correct discovery removal format](20261003_true_false_statuses_slice_02.md):
+   platform-only removal payloads and discovery-format regression validation.
 
 Validation: targeted MQTT/register tests, full unittest suite, CI CLI validation,
 Docker build/smoke when available. No live control writes. Actual HA rendering is a
