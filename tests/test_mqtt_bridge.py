@@ -2,6 +2,9 @@ import copy
 import json
 import types
 import unittest
+from unittest import mock
+
+from jinja2 import Environment, StrictUndefined
 
 from mqtt_bridge import MqttBridge
 
@@ -85,6 +88,92 @@ class MqttBridgeTests(unittest.TestCase):
     def connect(self):
         self.bridge.on_connect(self.client, None, None, 0)
 
+    def configs(self):
+        return {topic: json.loads(payload) for topic, payload, _, _ in self.client.published
+                if topic.startswith("homeassistant/device/")}
+
+    def test_truth_states_polarity_and_missing_values(self):
+        data = snapshot()
+        data["system"]["register_definitions"] = {"available": True}
+        self.bridge.publish_snapshot(data)
+        self.connect()
+        configs = self.configs()
+        parent = configs["homeassistant/device/pika2mqtt_0001000706fa/config"]["components"]
+        pv = configs["homeassistant/device/pika2mqtt_pv_00010003119c/config"]["components"]
+        cases = [
+            (pv["disconnected_truth"], "connected", True),
+            (pv["fault_truth"], "fault", False),
+            (pv["enabled_truth"], "enabled", False),
+            (pv["detailed_fault_data_unavailable_truth"], "detailed_fault_coverage", True),
+            (parent["any_string_disconnected_truth"], "any_string_disconnected", False),
+            (parent["any_string_faulted_truth"], "any_string_faulted", False),
+            (parent["decoded_definitions_available_truth"], "register_definitions.available", False),
+        ]
+        environment = Environment(undefined=StrictUndefined)
+        for component, key, inverted in cases:
+            with self.subTest(name=component["name"]):
+                self.assertEqual(component["platform"], "sensor")
+                self.assertTrue(component["unique_id"].endswith("_truth"))
+                for removed in ("payload_on", "payload_off", "device_class", "state_class", "unit_of_measurement"):
+                    self.assertNotIn(removed, component)
+                template = environment.from_string(component["value_template"])
+                for value in (True, False, None, 0, 1, "False"):
+                    state = {key: value} if "." not in key else {"register_definitions": {"available": value}}
+                    expected = str(not value if inverted else value) if isinstance(value, bool) else "unknown"
+                    self.assertEqual(template.render(value_json=state), expected)
+                self.assertEqual(template.render(value_json={}), "unknown")
+                if "." in key:
+                    for state in ({"register_definitions": None}, {"register_definitions": {}}):
+                        self.assertEqual(template.render(value_json=state), "unknown")
+        # Discovery presentation does not turn the underlying JSON into strings.
+        state = json.loads(next(p for t, p, _, _ in self.client.published if t.endswith("state/pv/00010003119C")))
+        self.assertIs(state["enabled"], True)
+        self.assertIs(state["fault"], False)
+
+    def test_truth_cleanup_does_not_remove_replacements_on_birth_or_restart(self):
+        self.bridge.publish_snapshot(snapshot())
+        self.connect()
+        topic = "homeassistant/device/pika2mqtt_pv_00010003119c/config"
+        configs = [json.loads(p) for t, p, _, _ in self.client.published if t == topic]
+        self.assertEqual(configs[0]["components"]["disconnected"], {})
+        self.assertNotIn("disconnected_truth", configs[0]["components"])
+        self.assertIn("power", configs[0]["components"])
+        final = configs[-1]
+        for name in ("disconnected", "fault", "enabled", "detailed_fault_data_unavailable"):
+            self.assertEqual(final["components"][name], {})
+            self.assertIn(name + "_truth", final["components"])
+        self.bridge.republish(force_discovery=True)
+        self.bridge = MqttBridge(self.client, "house/energy", "inverter.local")
+        self.bridge.publish_snapshot(snapshot())
+        self.connect()
+        for t, payload, _, _ in self.client.published:
+            if t.startswith("homeassistant/device/"):
+                components = json.loads(payload)["components"]
+                self.assertFalse(any(c.get("platform") == "binary_sensor" for c in components.values()))
+                self.assertFalse(any(k.endswith("_truth") and not c for k, c in components.items()))
+
+    def test_failed_truth_cleanup_is_retried_before_replacements(self):
+        config = self.bridge._config({}, {"flag": self.bridge._binary("root", "flag", "Flag", "state", availability=[])})
+        with mock.patch.object(self.bridge, "_publish", return_value=PublishResult(1)) as publish:
+            self.bridge._publish_config("root", config, False)
+            self.assertEqual(publish.call_count, 1)
+            self.assertNotIn("flag_truth", json.loads(publish.call_args.args[1])["components"])
+        self.assertEqual(self.bridge._discovery_payloads, {})
+        with mock.patch.object(self.bridge, "_publish", return_value=PublishResult()) as publish:
+            self.bridge._publish_config("root", config, False)
+            self.assertEqual(publish.call_count, 2)
+            self.assertIn("flag_truth", json.loads(publish.call_args.args[1])["components"])
+
+    def test_null_fault_and_enabled_keep_existing_unavailable_topics(self):
+        data = snapshot()
+        data["pv_links"]["00010003119C"]["enabled"] = None
+        data["pv_links"]["00010003119C"]["fault"] = None
+        self.bridge.publish_snapshot(data)
+        self.connect()
+        values = {(topic, payload) for topic, payload, _, _ in self.client.published}
+        for name in ("enabled", "fault"):
+            self.assertIn(("house/energy/availability/pv/00010003119C/" + name, "unavailable"), values)
+
     def test_configures_disconnected_lwt_and_bounded_reconnect(self):
         self.assertEqual(self.client.will, (("house/energy/availability/service", "disconnected"), {"qos": 1, "retain": True}))
         self.assertEqual(self.client.reconnect_delay, {"min_delay": 1, "max_delay": 60})
@@ -160,20 +249,20 @@ class MqttBridgeTests(unittest.TestCase):
         self.bridge.publish_snapshot(snapshot())
         self.connect()
         configs = [entry for entry in self.client.published if entry[0].startswith("homeassistant/device/")]
-        self.assertEqual(len(configs), 3)
         decoded = {entry[0]: json.loads(entry[1]) for entry in configs}
         parent_topic = "homeassistant/device/pika2mqtt_0001000706fa/config"
         self.assertIn(parent_topic, decoded)
         parent = decoded[parent_topic]
-        self.assertIn("any_string_disconnected", parent["components"])
-        self.assertIn("any_string_faulted", parent["components"])
+        self.assertEqual(len(decoded), 3)
+        self.assertIn("any_string_disconnected_truth", parent["components"])
+        self.assertIn("any_string_faulted_truth", parent["components"])
         mode = parent["components"]["system_operating_mode"]
         self.assertEqual(mode["name"], "System Operating Mode")
         self.assertEqual(mode["value_template"], "{{ value_json.system_operating_mode }}")
         child = decoded["homeassistant/device/pika2mqtt_pv_00010003119c/config"]
         self.assertEqual(child["device"]["via_device"], "pika2mqtt_0001000706fa")
-        self.assertIn("disconnected", child["components"])
-        self.assertIn("fault", child["components"])
+        self.assertIn("disconnected_truth", child["components"])
+        self.assertIn("fault_truth", child["components"])
 
     def test_battery_modules_publish_child_state_availability_and_discovery(self):
         self.bridge.publish_snapshot(snapshot_with_battery_modules())
@@ -549,18 +638,18 @@ class MqttBridgeTests(unittest.TestCase):
 
         child = next(
             json.loads(payload)
-            for topic, payload, _, _ in self.client.published
+            for topic, payload, _, _ in reversed(self.client.published)
             if topic == "homeassistant/device/pika2mqtt_pv_00010003119c/config"
         )
         components = child["components"]
-        self.assertEqual(components["disconnected"]["name"], "Communication lost")
+        self.assertEqual(components["disconnected_truth"]["name"], "Communication lost")
         self.assertEqual(
-            components["disconnected"]["unique_id"],
-            "pika2mqtt_pv_00010003119c_disconnected",
+            components["disconnected_truth"]["unique_id"],
+            "pika2mqtt_pv_00010003119c_disconnected_truth",
         )
-        enabled_topics = {item["topic"] for item in components["enabled"]["availability"]}
+        enabled_topics = {item["topic"] for item in components["enabled_truth"]["availability"]}
         status_topics = {item["topic"] for item in components["status"]["availability"]}
-        fault_topics = {item["topic"] for item in components["fault"]["availability"]}
+        fault_topics = {item["topic"] for item in components["fault_truth"]["availability"]}
         self.assertIn(
             "house/energy/availability/pv/00010003119C/enabled",
             enabled_topics,
@@ -581,9 +670,9 @@ class MqttBridgeTests(unittest.TestCase):
             "house/energy/availability/model/00010003119C/pvlink_status",
             fault_topics,
         )
-        coverage = components["detailed_fault_data_unavailable"]
+        coverage = components["detailed_fault_data_unavailable_truth"]
         self.assertFalse(coverage["enabled_by_default"])
-        self.assertEqual(coverage["device_class"], "problem")
+        self.assertNotIn("device_class", coverage)
 
     def test_home_assistant_birth_and_reconnect_republish(self):
         self.bridge.publish_snapshot(snapshot())

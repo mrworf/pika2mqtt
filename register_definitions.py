@@ -210,6 +210,7 @@ class DefinitionSet:
                  f"Definition SHA256: `{self.checksum}`", "",
                  f"Reported firmware: {', '.join(f'{s}: {v}' for s, v in sorted(versions.items())) or 'not yet reported'}", "",
                  "Enums describe one state; bitfields describe simultaneous flags. Ev is the last event, not an active fault or event history.", "",
+                 "Home Assistant read-only flags are sensors displaying True when the named firmware bit is active and False when inactive. Unknown or unavailable is not False. Automation states are the strings `True` and `False`, not on/off.", "",
                  "Severity is application policy, not firmware documentation. RESERVED/UNUSED symbols are raw diagnostics only. Missing descriptions are not inferred.", ""]
         for (model, section, field), definition in sorted(self.registers.items()):
             lines += [f"## {model}.{section}.{field}", "", cell(definition["description"] or "No description provided by firmware."), "",
@@ -226,7 +227,8 @@ class DefinitionSet:
         parts = ['<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firmware register reference</title><style>body{max-width:1100px;margin:2em auto;padding:0 1em;font:16px system-ui}table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid #aaa;padding:.5em;text-align:left;overflow-wrap:anywhere}code{overflow-wrap:anywhere}section{margin:2em 0}</style></head><body><h1>Firmware register reference</h1><p><a href="/diagnostics/registers.md">Download Markdown</a></p>',
                  f'<p>Source: <code>{escape(SOURCE)}</code><br>Definition SHA256: <code>{escape(self.checksum)}</code></p>',
                  f'<p>Reported firmware: {escape(versions or "not yet reported")}</p>',
-                 '<p>Enums describe one state; bitfields describe simultaneous flags. Ev is the last event, not an active fault or event history. Classification is application policy, not firmware documentation.</p>']
+                 '<p>Enums describe one state; bitfields describe simultaneous flags. Ev is the last event, not an active fault or event history. Classification is application policy, not firmware documentation.</p>',
+                 '<p>Home Assistant read-only flags are sensors displaying True when the named firmware bit is active and False when inactive. Unknown or unavailable is not False. Automation states are the strings <code>True</code> and <code>False</code>, not on/off.</p>']
         for (model, section, field), definition in sorted(self.registers.items()):
             parts += [f'<section><h2>{escape(model)}.{escape(section)}.{escape(field)}</h2>',
                       f'<p>{escape(definition["description"] or "No description provided by firmware.")}</p>',

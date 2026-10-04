@@ -47,6 +47,7 @@ class MqttBridge:
         self._root_id: str | None = None
         self._root_serial: str | None = None
         self._discovery_payloads: dict[str, str] = {}
+        self._removed_boolean_components: dict[str, set[str]] = {}
         self._known_battery_modules: dict[str, set[int]] = {}
         self._manifest_file = diagnostic_manifest_file
         self._diagnostic_manifest = {}
@@ -55,6 +56,10 @@ class MqttBridge:
                 manifest = json.loads(Path(diagnostic_manifest_file).read_text())
                 if not isinstance(manifest, dict) or any(not isinstance(key, str) or not isinstance(values, dict) or not isinstance(values.get("components"), dict) or not isinstance(values.get("checksum"), str) for key, values in manifest.items()):
                     raise ValueError("invalid manifest")
+                for values in manifest.values():
+                    legacy = values.get("legacy_boolean_components", [])
+                    if not isinstance(legacy, list) or any(not isinstance(key, str) for key in legacy):
+                        raise ValueError("invalid legacy boolean component list")
                 self._diagnostic_manifest = manifest
             except FileNotFoundError:
                 pass
@@ -431,19 +436,75 @@ class MqttBridge:
             "qos": self.QOS,
         }
 
+    @staticmethod
+    def _truth_components(components):
+        """Normalize current and persisted legacy boolean discovery definitions.
+
+        Legacy templates are generated locally, not taken from firmware. Firmware
+        still owns each symbol, bit position, label, and severity attribute.
+        """
+        normalized, legacy = {}, set()
+        for key, component in components.items():
+            if component.get("platform") != "binary_sensor":
+                normalized[key] = component
+                continue
+            match = re.fullmatch(r"\{\{ '(ON|OFF)' if (.+) else '(ON|OFF)' \}\}", component["value_template"])
+            if not match or match[1] == match[3]:
+                raise ValueError(f"Unsupported boolean discovery template: {key}")
+            expression = match[2]
+            source = expression.split(" in ", 1)[-1] if " in " in expression else expression.removesuffix(" == true")
+            # Guard every ancestor, including absent decoded_registers entries.
+            path, guards = "value_json", []
+            for segment in re.findall(r'\.[A-Za-z_]\w*|\["(?:\\.|[^"\\])*"\]', source.removeprefix("value_json")):
+                path += segment
+                guards.append(f"{path} is defined and {path} is not none")
+            if " in " in expression:
+                guards.append(f"{source} is sequence and {source} is not string and {source} is not mapping")
+            else:
+                guards.append(f"{source} is boolean")
+            true_value, false_value = ("True", "False") if match[1] == "ON" else ("False", "True")
+            template = "{% if " + " and ".join(guards) + " %}{{ '" + true_value + "' if " + expression + " else '" + false_value + "' }}{% else %}unknown{% endif %}"
+            truth = {name: value for name, value in component.items()
+                     if name not in ("payload_on", "payload_off", "device_class")}
+            truth.update(platform="sensor", unique_id=component["unique_id"] + "_truth", value_template=template)
+            normalized[key + "_truth"] = truth
+            legacy.add(key)
+        return normalized, legacy
+
     def _publish_config(self, object_id: str, config: dict[str, Any], force: bool):
         topic = f"{self.discovery_prefix}/device/{object_id}/config"
         health = (self._latest or {}).get("system", {}).get("register_definitions", {})
         valid = bool(health.get("available"))
         checksum = health.get("checksum") or ""
         previous = self._diagnostic_manifest.get(topic, {"components": {}, "checksum": ""})
-        old_components = previous["components"]
+        old_components, old_boolean_keys = self._truth_components(previous["components"])
+        components, boolean_keys = self._truth_components(config["components"])
+        config = {**config, "components": components}
         if not valid or previous["checksum"] == checksum:
             # Missing observations do not imply a register was removed from firmware.
             config = {**config, "components": {**old_components, **config["components"]}}
+        legacy_keys = (boolean_keys | old_boolean_keys
+                       | set(previous.get("legacy_boolean_components", []))
+                       | {key.removesuffix("_truth") for key in config["components"] if key.endswith("_truth")})
+        # Retain tombstones in the final message too: HA may be offline during
+        # the intermediate cleanup publication. Persist their identities across
+        # restarts/firmware changes, independently of firmware pruning.
+        config = {**config, "components": {**config["components"], **{key: {} for key in legacy_keys}}}
         payload = self._json(config)
         if force or self._discovery_payloads.get(topic) != payload:
-            generated = {key: value for key, value in config["components"].items() if key.startswith("decoded_")}
+            generated = {key: value for key, value in config["components"].items() if key.startswith("decoded_") and value}
+            removed_booleans = self._removed_boolean_components.setdefault(topic, set())
+            legacy = legacy_keys - removed_booleans
+            if legacy:
+                # Distinct replacement keys make cleanup safe on every restart.
+                # Omitted components are retained by HA; only {} removes them.
+                cleanup = {**config, "components": {
+                    **{key: value for key, value in config["components"].items() if not key.endswith("_truth")},
+                    **{key: {} for key in legacy},
+                }}
+                if getattr(self._publish(topic, self._json(cleanup)), "rc", 0):
+                    return
+                removed_booleans.update(legacy)
             # Only validated definitions justify deleting firmware-generated entities.
             if valid:
                 removed = set(old_components) - set(generated)
@@ -454,8 +515,9 @@ class MqttBridge:
             if getattr(self._publish(topic, payload), "rc", 0):
                 return
             self._discovery_payloads[topic] = payload
-            manifest = {"checksum": checksum, "components": generated}
-            if valid and previous != manifest:
+            manifest = {"checksum": checksum if valid else previous["checksum"], "components": generated,
+                        "legacy_boolean_components": sorted(legacy_keys)}
+            if previous != manifest:
                 self._diagnostic_manifest[topic] = manifest
                 if self._manifest_file:
                     try:

@@ -186,17 +186,23 @@ measurements, not energy-throughput counters.
 
 Each string has separate signals with different meanings:
 
-- **Enabled**: whether the PV Link is enabled.
+- **Enabled**: `True` when the PV Link is enabled, `False` when disabled.
 - **Communication lost**: whether the string stopped communicating; a disabled
-  string can still communicate normally.
-- **Fault / Fault summary**: observed current fault state and its interpretation.
+  string can still communicate normally. `True` means communication was lost;
+  `False` means it was not.
+- **Fault / Fault summary**: `True` when a fault is reported, `False` when no fault
+  is reported; Fault summary provides its interpretation.
 - **Detailed fault data unavailable**: optional diagnostic indicating reduced
-  coverage when detailed models cannot be read.
+  coverage when detailed models cannot be read (`True` means reduced coverage).
 
 Use Home Assistant's entity picker to create an alert for an individual string or
 the system's **String disconnected** and **String fault** aggregate sensors.
-For problem sensors, `on` indicates a problem. Consider a sustained-state duration
-to avoid transient alerts, and handle `unavailable` separately.
+Read-only boolean entities are ordinary `sensor.*` entities displaying exactly
+`True` or `False`: the value says whether the named statement is true. Automation
+state comparisons must use the quoted strings `"True"` and `"False"`, not `on`/`off`.
+Consider a sustained-state duration to avoid transient alerts, and handle
+`unknown` and `unavailable` separately—neither means `False`. Existing users must
+[migrate old binary-sensor references](docs/MIGRATION.md#truefalse-status-entity-migration).
 
 Communication loss is declared after 120 seconds by default. Detailed values have
 a two-minute freshness window; only affected entities become unavailable after
@@ -246,6 +252,9 @@ Open a device's entity list to enable the diagnostic flags you want to monitor o
 use in automations. Status/enum attributes list supported states; register attributes
 include raw values, symbols and available descriptions. Definitions are loaded from
 your inverter's firmware, so supported flags can differ between systems.
+Individual flag sensors display `True` when the named firmware bit is active and
+`False` when inactive. Positive flags such as Heartbeat Good are not faults simply
+because they are `True`; inspect their description and policy classification.
 
 The generated reference lists states, flags, numeric values, firmware descriptions
 and application fault classifications:

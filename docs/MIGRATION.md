@@ -41,23 +41,70 @@ and `/key/id_rsa` interfaces remain available.
 
 ## Compatibility changes
 
+### True/False status entity migration
+
+Read-only boolean entities now display literal `True`/`False` instead of
+On/Off or OK/Problem. This is a **breaking Home Assistant entity change**: they
+move from `binary_sensor.*` to ordinary `sensor.*` entities. Discovery component
+keys and unique IDs gain `_truth`; Home Assistant chooses the resulting entity IDs
+from names and existing registry entries, so use its entity picker rather than
+guessing the ID from the unique ID.
+
+Affected entities include Communication lost, Fault, Enabled, Detailed fault data
+unavailable, String disconnected, String fault, Register definitions available,
+and individual firmware-defined bit flags. Their names and polarity are unchanged:
+Communication lost True means lost communication; Enabled False means disabled.
+Unknown/unavailable does not mean False. Default-enabled/diagnostic settings and
+firmware descriptions/classifications are preserved.
+
+After updating:
+
+1. Wait for MQTT discovery and definitions to load. Legacy binary discovery is
+   removed automatically; persisted firmware flags are also migrated if definition
+   loading is temporarily unavailable.
+2. Replace old binary-sensor references in dashboards, automations, scripts, and
+   helpers with the newly discovered sensors. Re-enable optional diagnostic flags
+   and reapply any custom names/settings to their new entities as needed.
+3. Replace `on` comparisons with the quoted string `"True"` and `off` with `"False"`.
+   Keep unavailable handling separate. For example, a state trigger becomes:
+
+   ```yaml
+   triggers:
+     - trigger: state
+       entity_id: sensor.replace_with_actual_communication_lost_entity
+       to: "True"
+       for: "00:02:00"
+   ```
+
+Switches/selectors and their control commands are unchanged. Raw MQTT JSON still
+uses boolean true/false, not strings. On rollback to an older image, the previous
+binary entities return. Restore the backed-up pre-upgrade
+`/data/register_discovery.json` (or move the newer manifest aside), and remove the
+newer `_truth` discovery components or this integration's retained device discovery
+configs before restarting the old image to avoid duplicate entities. Preserve the
+PV inventory and do not clear unrelated MQTT discovery topics.
+
+### Earlier telemetry and control changes
+
 If an existing deployment already sets `OPERATING_MODE_CONTROL_ENABLED=true`,
 upgrading also exposes an `Enabled Control` switch for every PV Link. Review
 MQTT ACLs and Home Assistant user permissions before upgrading, or set the flag
-to `false` until PV Link control is desired. The read-only Enabled entity and
-all existing state topics remain compatible.
+to `false` until PV Link control is desired. Existing JSON state topics remain
+compatible; the read-only Enabled entity follows the True/False migration above.
 
 The current integration also changes PV Link availability semantics. Core status and
 fault monitoring now use the controller directory and remain available when
 firmware rejects optional per-PV model reads. The existing Fault and Status
-entity identifiers are unchanged. A new disabled-by-default `Detailed fault
+entity identifiers were unchanged by that telemetry update (Fault now follows
+the True/False migration above). A new disabled-by-default `Detailed fault
 data unavailable` diagnostic reports when PVLink/PVRSS-specific coverage is
 missing. Existing deployments need no configuration change; optionally set
 `DETAIL_REQUEST_TIMEOUT` if the 20-second default is unsuitable for a
 particularly slow appliance.
 
 Firmware register decoding is now loaded over SSH from the inverter at startup.
-Existing MQTT topics, control commands and entity identifiers remain intact, but
+Existing MQTT topics and control commands remain intact (boolean entities now
+follow the True/False migration above), but
 Status text follows the firmware symbol names in lowercase. For example, older
 `input_over_voltage` states become `over_voltage_input`; `status_code` now preserves
 the complete code instead of masking its low four bits. Review automations that

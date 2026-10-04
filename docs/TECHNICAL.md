@@ -27,10 +27,11 @@ Existing inverter, battery and PV Link devices gain these MQTT-discovered diagno
   names and coverage status as attributes. It becomes unavailable if required
   assessment registers are missing, stale, ambiguous or contain unknown values.
   Several indicators may describe the same underlying physical problem.
-- **Individual flags**: disabled-by-default diagnostic binary sensors for every
+- **Individual flags**: disabled-by-default diagnostic True/False sensors for every
   documented, non-reserved bit. Enable the desired entities on the device page to
-  use them in dashboards and automations. Error/warning flags use the problem
-  device class; ordinary flags retain their positive meaning, such as Heartbeat Good.
+  use them in dashboards and automations. `True` means the named bit is active;
+  `False` means inactive. Positive flags retain their meaning, such as Heartbeat Good.
+  Severity remains in the `policy_classification` attribute, not a device-class label.
 - **Register definitions available**: a service diagnostic with source, checksum,
   firmware versions and the latest load error as attributes.
 
@@ -41,6 +42,18 @@ raw values, active symbols, descriptions, unknown-bit masks and interpretation
 availability. Stable flag identifiers use serial/model/register/bit position so
 firmware label changes do not replace entities. Temporary missing data does not
 remove entities; firmware definition changes reconcile obsolete generated components.
+
+All read-only boolean discovery entities use the ordinary `sensor` platform, with
+`_truth` appended to component keys and unique IDs. Guarded templates produce the
+explicit strings `True` and `False`; absent/null/invalid source values produce
+`unknown`, not a false clearance. Existing freshness/availability topics still make
+stale sources unavailable. JSON state payloads retain their actual boolean values.
+Legacy binary components are explicitly removed before replacements are published,
+including persisted diagnostic components while definitions are unavailable.
+Removal markers are retained in the final discovery message and tracked in the
+manifest, so a Home Assistant instance offline during migration can also clean up
+old entities after reconnecting.
+Controls retain their existing switch/select platforms and ON/OFF command payloads.
 
 PV Link Fault and Fault summary use corrected firmware error bits and PVRSS lockout
 interpretation. Core fault monitoring still works from a valid controller directory
@@ -75,10 +88,10 @@ register. Consult the reference from your own firmware for the available values.
 The firmware bundle can include models for hardware you do not have. Home Assistant
 entities are generated only for models and records collected for your devices.
 
-For an automation, enable the relevant binary sensor, select it using Home Assistant's
-entity picker, and trigger on `off` → `on` for an error (or `on` → `off` for a positive
-health flag). Use `for:` to require a sustained condition, and handle `unavailable`
-separately. An unavailable reading is not a cleared fault. Check supported states
+For an automation, enable the relevant sensor, select it using Home Assistant's
+entity picker, and trigger on `"False"` → `"True"` for an error (or `"True"` → `"False"`
+for a positive health flag). Use `for:` to require a sustained condition, and handle
+`unknown`/`unavailable` separately. Neither is a cleared fault. Check supported states
 before comparing an enum sensor's state in a template.
 
 Severity comes from the bundled [register_policy.json](../register_policy.json), not
@@ -183,7 +196,7 @@ but cannot be commanded through pika2mqtt. The existing read-only System
 Operating Mode sensor remains available for dashboards and automations.
 
 Each PV Link switch sends an exact, non-retained `ON` or `OFF` command. The
-existing read-only `Enabled` binary sensor is unchanged. It prefers the
+read-only `Enabled` sensor displays True/False. It prefers the
 controller's fresh device-directory state and falls back to `pvlink_status`
 when the directory is unavailable; the control switch itself becomes
 unavailable unless the service, inverter, PV Link, and authoritative directory
@@ -263,8 +276,8 @@ informational message when valid power resumes.
 Each PV Link has independent communication, enabled, and fault signals.
 Communication is based on `/devices` presence and `lastheard`; the
 `Communication lost` entity changes only after 120 seconds by default. A PV
-Link that is disabled but still responding therefore shows Enabled Off and
-Communication lost OK. A detailed model returning HTTP 400/500 does not by
+Link that is disabled but still responding therefore shows Enabled False and
+Communication lost False. A detailed model returning HTTP 400/500 does not by
 itself disconnect a string.
 
 Detailed model values have a two-minute freshness window. A brief endpoint
@@ -280,7 +293,7 @@ available from that source when optional PV models fail. Fresh optional models
 add PV Link error bits, PVRSS lockout, and failed PVRSS self-tests; the
 disabled-by-default `Detailed fault data unavailable` diagnostic identifies
 reduced coverage. The system device provides separate aggregate “any string
-disconnected” and “any string faulted” binary sensors for alerting.
+disconnected” and “any string faulted” True/False sensors for alerting.
 
 ## Polling and recovery
 

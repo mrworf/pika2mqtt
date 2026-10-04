@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from jinja2 import Environment, StrictUndefined
 
 from register_definitions import DefinitionSet, RegisterDefinitions, atomic_write, load_policy
 from pika_transport import SshTunnelConfig, SshTunnelSupervisor
@@ -139,6 +140,8 @@ class DefinitionTests(unittest.TestCase):
         self.assertIn(d.health()["checksum"], reference)
         self.assertNotIn("<script>", d.reference(html_format=True))
         self.assertIn("&lt;script&gt;", d.reference(html_format=True))
+        self.assertIn("True when the named firmware bit is active", reference)
+        self.assertIn("True when the named firmware bit is active", d.reference(html_format=True))
 
     def test_logging_transitions_and_recovery_without_false_clearance(self):
         d = definitions()
@@ -250,11 +253,12 @@ class DiagnosticMqttTests(unittest.TestCase):
         bridge.publish_snapshot(data)
         config = json.loads([p[1] for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")][-1])
         components = config["components"]
-        flag = components["decoded_pvlink_status_fixed_errorword_bit_1"]
+        flag = components["decoded_pvlink_status_fixed_errorword_bit_1_truth"]
         self.assertFalse(flag["enabled_by_default"])
         self.assertIn("HW_ARC_FAULT", flag["value_template"])
-        self.assertEqual(flag["device_class"], "problem")
-        self.assertNotIn("decoded_pvlink_status_fixed_errorword_bit_0", components)
+        self.assertEqual(flag["platform"], "sensor")
+        self.assertNotIn("device_class", flag)
+        self.assertNotIn("decoded_pvlink_status_fixed_errorword_bit_0_truth", components)
         event = components["decoded_rebus_status_fixed_ev"]
         self.assertTrue(event["enabled_by_default"])
         self.assertIn("supported_states", event["json_attributes_template"])
@@ -263,6 +267,69 @@ class DiagnosticMqttTests(unittest.TestCase):
         data["pv_links"]["00010003119C"]["decoded_registers"]["pvlink_status.fixed.ErrorWord"]["available"] = False
         bridge.publish_snapshot(data)
         self.assertTrue(any(p[0].endswith("pvlink_status_fixed_errorword") and p[1] == "unavailable" for p in client.published))
+
+    def test_firmware_flag_templates_are_true_false_and_guard_missing_ancestors(self):
+        client = FakeClient()
+        bridge = MqttBridge(client, "energy", "inv")
+        data = self.data()
+        bridge.publish_snapshot(data)
+        bridge.on_connect(client, None, None, 0)
+        config = json.loads([p[1] for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")][-1])
+        flags = [c for key, c in config["components"].items() if "_bit_" in key and c]
+        self.assertTrue(flags)
+        for flag in flags:
+            template = Environment(undefined=StrictUndefined).from_string(flag["value_template"])
+            self.assertIn(template.render(value_json=data["pv_links"]["00010003119C"]), ("True", "False"))
+            self.assertNotIn("device_class", flag)
+            for state in ({}, {"decoded_registers": None}, {"decoded_registers": {}}):
+                self.assertEqual(template.render(value_json=state), "unknown")
+        flag = config["components"]["decoded_pvlink_status_fixed_errorword_bit_1_truth"]
+        template = Environment(undefined=StrictUndefined).from_string(flag["value_template"])
+        for symbols, expected in ((["HW_ARC_FAULT"], "True"), ([], "False"),
+                                  (None, "unknown"), ("HW_ARC_FAULT", "unknown"), ({}, "unknown")):
+            state = {"decoded_registers": {"pvlink_status.fixed.ErrorWord": {"active_symbols": symbols}}}
+            self.assertEqual(template.render(value_json=state), expected)
+
+    def test_legacy_cached_binary_manifest_migrates_without_loaded_definitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = str(Path(directory, "manifest.json"))
+            client = FakeClient()
+            bridge = MqttBridge(client, "energy", "inv", diagnostic_manifest_file=manifest)
+            data = self.data()
+            bridge.publish_snapshot(data)
+            bridge.on_connect(client, None, None, 0)
+            # Simulate the exact pre-upgrade persisted diagnostic representation.
+            topic = "homeassistant/device/pika2mqtt_pv_00010003119c/config"
+            legacy = bridge._diagnostic_manifest
+            generated = bridge._diagnostic_components("pika2mqtt_pv_00010003119c", "energy/state/pv/00010003119C", data["pv_links"]["00010003119C"], [])
+            legacy[topic]["components"] = generated
+            atomic_write(manifest, json.dumps(legacy))
+            data["system"].pop("register_definitions")
+            data["pv_links"]["00010003119C"]["decoded_registers"] = {}
+            data["pv_links"]["00010003119C"]["active_error_count"] = None
+            client.published.clear()
+            bridge = MqttBridge(client, "energy", "inv", diagnostic_manifest_file=manifest)
+            bridge.publish_snapshot(data)
+            bridge.on_connect(client, None, None, 0)
+            configs = [json.loads(p[1]) for p in client.published if p[0] == topic]
+            self.assertEqual(configs[0]["components"]["decoded_pvlink_status_fixed_errorword_bit_1"], {})
+            final = configs[-1]["components"]
+            self.assertIn("decoded_pvlink_status_fixed_errorword_bit_1_truth", final)
+            self.assertEqual(final["decoded_pvlink_status_fixed_errorword_bit_1"], {})
+            cached = json.loads(Path(manifest).read_text())[topic]
+            self.assertEqual(cached["checksum"], legacy[topic]["checksum"])
+            self.assertFalse(any(c["platform"] == "binary_sensor" for c in cached["components"].values()))
+            for p in client.published:
+                if p[0].startswith("energy/availability/register/"):
+                    self.assertEqual(p[1], "unavailable")
+            # A second restart must not recreate a binary or delete a truth sensor.
+            client.published.clear()
+            bridge = MqttBridge(client, "energy", "inv", diagnostic_manifest_file=manifest)
+            bridge.publish_snapshot(data)
+            bridge.on_connect(client, None, None, 0)
+            for p in client.published:
+                if p[0] == topic:
+                    self.assertFalse(any(k.endswith("_truth") and not c for k, c in json.loads(p[1])["components"].items()))
 
     def test_manifest_removes_obsolete_components_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -279,8 +346,16 @@ class DiagnosticMqttTests(unittest.TestCase):
             client.published.clear()
             bridge.publish_snapshot(data)
             configs = [json.loads(p[1]) for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")]
-            self.assertEqual(configs[0]["components"]["decoded_rebus_status_fixed_rb_bit_0"], {})
-            self.assertNotIn("decoded_rebus_status_fixed_rb_bit_0", configs[-1]["components"])
+            self.assertTrue(any(c["components"].get("decoded_rebus_status_fixed_rb_bit_0_truth") == {} for c in configs))
+            self.assertNotIn("decoded_rebus_status_fixed_rb_bit_0_truth", configs[-1]["components"])
+            self.assertEqual(configs[-1]["components"]["decoded_rebus_status_fixed_rb_bit_0"], {})
+            # Offline HA sees only retained discovery; cleanup must survive a
+            # restart after firmware stopped exposing the historical bit.
+            bridge = MqttBridge(client, "energy", "inv", diagnostic_manifest_file=manifest)
+            bridge.publish_snapshot(data)
+            bridge.on_connect(client, None, None, 0)
+            final = json.loads([p[1] for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")][-1])
+            self.assertEqual(final["components"]["decoded_rebus_status_fixed_rb_bit_0"], {})
 
     def test_unavailable_definitions_do_not_prune_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,7 +382,7 @@ class DiagnosticMqttTests(unittest.TestCase):
         bridge.publish_snapshot(data)
         bridge.republish(force_discovery=True)
         config = json.loads([p[1] for p in client.published if p[0].endswith("pika2mqtt_pv_00010003119c/config")][-1])
-        self.assertIn("decoded_rebus_status_fixed_rb_bit_0", config["components"])
+        self.assertIn("decoded_rebus_status_fixed_rb_bit_0_truth", config["components"])
         self.assertTrue(any(p[0].endswith("rebus_status_fixed_rb") and p[1] == "unavailable" for p in client.published))
 
 
